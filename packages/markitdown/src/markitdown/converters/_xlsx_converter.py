@@ -4,6 +4,11 @@ from ._html_converter import HtmlConverter
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
 from .._stream_info import StreamInfo
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 # Try loading optional (but in this case, required) dependencies
 # Save reporting of any exceptions for later
@@ -82,9 +87,20 @@ class XlsxConverter(DocumentConverter):
 
         sheets = pd.read_excel(file_stream, sheet_name=None, engine="openpyxl")
         md_content = ""
+
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.85)
+        sheet_count = len(sheets)
+        total_rows = 0
+        total_cols = 0
+
         for s in sheets:
             md_content += f"## {s}\n"
-            html_content = sheets[s].to_html(index=False)
+            df = sheets[s]
+            total_rows += len(df)
+            total_cols = max(total_cols, len(df.columns))
+
+            html_content = df.to_html(index=False)
             md_content += (
                 self._html_converter.convert_string(
                     html_content, **kwargs
@@ -92,7 +108,41 @@ class XlsxConverter(DocumentConverter):
                 + "\n\n"
             )
 
-        return DocumentConverterResult(markdown=md_content.strip())
+        # Set metrics
+        quality.set_metric("sheet_count", sheet_count)
+        quality.set_metric("total_rows", total_rows)
+        quality.set_metric("max_columns", total_cols)
+
+        # XLSX formatting that is lost
+        quality.add_warning(
+            "Cell formatting (colors, fonts, borders) is not preserved.",
+            severity=WarningSeverity.LOW,
+            formatting_type=FormattingLossType.TABLE_FORMATTING,
+        )
+
+        quality.add_warning(
+            "Formulas are converted to their calculated values only.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.SPREADSHEET_FORMULA,
+        )
+
+        quality.add_warning(
+            "Merged cells are not represented in markdown tables.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.TABLE_FORMATTING,
+        )
+
+        quality.add_formatting_loss(FormattingLossType.TEXT_COLOR)
+        quality.add_formatting_loss(FormattingLossType.CHART)
+        quality.add_formatting_loss(FormattingLossType.IMAGE)
+
+        quality.add_warning(
+            "Charts and images embedded in the spreadsheet are not extracted.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.CHART,
+        )
+
+        return DocumentConverterResult(markdown=md_content.strip(), quality=quality)
 
 
 class XlsConverter(DocumentConverter):
@@ -144,9 +194,20 @@ class XlsConverter(DocumentConverter):
 
         sheets = pd.read_excel(file_stream, sheet_name=None, engine="xlrd")
         md_content = ""
+
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.80)  # Slightly lower for legacy format
+        sheet_count = len(sheets)
+        total_rows = 0
+        total_cols = 0
+
         for s in sheets:
             md_content += f"## {s}\n"
-            html_content = sheets[s].to_html(index=False)
+            df = sheets[s]
+            total_rows += len(df)
+            total_cols = max(total_cols, len(df.columns))
+
+            html_content = df.to_html(index=False)
             md_content += (
                 self._html_converter.convert_string(
                     html_content, **kwargs
@@ -154,4 +215,37 @@ class XlsConverter(DocumentConverter):
                 + "\n\n"
             )
 
-        return DocumentConverterResult(markdown=md_content.strip())
+        # Set metrics
+        quality.set_metric("sheet_count", sheet_count)
+        quality.set_metric("total_rows", total_rows)
+        quality.set_metric("max_columns", total_cols)
+
+        # XLS formatting that is lost
+        quality.add_warning(
+            "Cell formatting (colors, fonts, borders) is not preserved.",
+            severity=WarningSeverity.LOW,
+            formatting_type=FormattingLossType.TABLE_FORMATTING,
+        )
+
+        quality.add_warning(
+            "Formulas are converted to their calculated values only.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.SPREADSHEET_FORMULA,
+        )
+
+        quality.add_warning(
+            "Merged cells are not represented in markdown tables.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.TABLE_FORMATTING,
+        )
+
+        quality.add_warning(
+            "Legacy XLS format may have limited feature support compared to XLSX.",
+            severity=WarningSeverity.INFO,
+        )
+
+        quality.add_formatting_loss(FormattingLossType.TEXT_COLOR)
+        quality.add_formatting_loss(FormattingLossType.CHART)
+        quality.add_formatting_loss(FormattingLossType.IMAGE)
+
+        return DocumentConverterResult(markdown=md_content.strip(), quality=quality)

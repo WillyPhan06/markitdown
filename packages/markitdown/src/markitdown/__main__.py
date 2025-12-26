@@ -2,6 +2,7 @@
 #
 # SPDX-License-Identifier: MIT
 import argparse
+import json
 import sys
 import codecs
 from textwrap import dedent
@@ -110,6 +111,19 @@ def main():
         help="Keep data URIs (like base64-encoded images) in the output. By default, data URIs are truncated.",
     )
 
+    parser.add_argument(
+        "-q",
+        "--quality",
+        action="store_true",
+        help="Show conversion quality information after the output.",
+    )
+
+    parser.add_argument(
+        "--quality-json",
+        action="store_true",
+        help="Output conversion quality information as JSON to stderr.",
+    )
+
     parser.add_argument("filename", nargs="?")
     args = parser.parse_args()
 
@@ -212,6 +226,17 @@ def _handle_output(args, result: DocumentConverterResult):
                 sys.stdout.encoding
             )
         )
+
+    # Output quality information if requested
+    if args.quality_json:
+        quality_dict = result.quality.to_dict()
+        print(json.dumps(quality_dict, indent=2), file=sys.stderr)
+    elif args.quality:
+        print("\n" + "=" * 60, file=sys.stderr)
+        print("CONVERSION QUALITY REPORT", file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
+        print(str(result.quality), file=sys.stderr)
+        print("=" * 60, file=sys.stderr)
 
 
 def _exit_with_error(message: str):

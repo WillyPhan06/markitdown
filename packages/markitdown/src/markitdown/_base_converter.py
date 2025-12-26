@@ -1,4 +1,8 @@
-from typing import Any, BinaryIO, Optional
+from typing import Any, BinaryIO, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ._conversion_quality import ConversionQuality
+
 from ._stream_info import StreamInfo
 
 
@@ -10,19 +14,42 @@ class DocumentConverterResult:
         markdown: str,
         *,
         title: Optional[str] = None,
+        quality: Optional["ConversionQuality"] = None,
     ):
         """
         Initialize the DocumentConverterResult.
 
         The only required parameter is the converted Markdown text.
-        The title, and any other metadata that may be added in the future, are optional.
+        The title, quality info, and any other metadata that may be added in the future, are optional.
 
         Parameters:
         - markdown: The converted Markdown text.
         - title: Optional title of the document.
+        - quality: Optional ConversionQuality object with metadata about the conversion quality.
         """
         self.markdown = markdown
         self.title = title
+        self._quality = quality
+
+    @property
+    def quality(self) -> "ConversionQuality":
+        """
+        Get the quality information for this conversion.
+
+        Returns a ConversionQuality object. If no quality info was provided
+        during conversion, returns a default object with 100% confidence.
+        """
+        if self._quality is None:
+            # Lazy import to avoid circular dependencies
+            from ._conversion_quality import ConversionQuality
+
+            self._quality = ConversionQuality()
+        return self._quality
+
+    @quality.setter
+    def quality(self, value: "ConversionQuality") -> None:
+        """Set the quality information for this conversion."""
+        self._quality = value
 
     @property
     def text_content(self) -> str:

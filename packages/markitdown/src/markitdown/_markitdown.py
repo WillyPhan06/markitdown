@@ -42,6 +42,7 @@ from .converters import (
 )
 
 from ._base_converter import DocumentConverter, DocumentConverterResult
+from ._conversion_quality import ConversionQuality
 
 from ._exceptions import (
     FileConversionException,
@@ -612,6 +613,12 @@ class MarkItDown:
                         [line.rstrip() for line in re.split(r"\r?\n", res.text_content)]
                     )
                     res.text_content = re.sub(r"\n{3,}", "\n\n", res.text_content)
+
+                    # Ensure quality info exists and record which converter was used
+                    if res._quality is None:
+                        res._quality = ConversionQuality()
+                    res._quality.converter_used = type(converter).__name__
+
                     return res
 
         # If we got this far without success, report any exceptions

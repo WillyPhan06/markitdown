@@ -8,6 +8,11 @@ from typing import BinaryIO, Any, Dict, List
 from ._html_converter import HtmlConverter
 from .._base_converter import DocumentConverterResult
 from .._stream_info import StreamInfo
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 ACCEPTED_MIME_TYPE_PREFIXES = [
     "application/epub",
@@ -56,6 +61,16 @@ class EpubConverter(HtmlConverter):
         stream_info: StreamInfo,
         **kwargs: Any,  # Options to pass to the converter
     ) -> DocumentConverterResult:
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.85)
+        sections_detected = 0
+        sections_converted = 0
+        sections_skipped = 0
+        skipped_files: List[str] = []
+        has_title = False
+        has_authors = False
+        metadata_fields_found: List[str] = []
+
         with zipfile.ZipFile(file_stream, "r") as z:
             # Extracts metadata (title, authors, language, publisher, date, description, cover) from an EPUB file."""
 
@@ -77,6 +92,15 @@ class EpubConverter(HtmlConverter):
                 "identifier": self._get_text_from_node(opf_dom, "dc:identifier"),
             }
 
+            # Track metadata fields found
+            for key, value in metadata.items():
+                if value:
+                    metadata_fields_found.append(key)
+                    if key == "title":
+                        has_title = True
+                    elif key == "authors":
+                        has_authors = True
+
             # Extract manifest items (ID → href mapping)
             manifest = {
                 item.getAttribute("id"): item.getAttribute("href")
@@ -86,6 +110,7 @@ class EpubConverter(HtmlConverter):
             # Extract spine order (ID refs)
             spine_items = opf_dom.getElementsByTagName("itemref")
             spine_order = [item.getAttribute("idref") for item in spine_items]
+            sections_detected = len(spine_order)
 
             # Convert spine order to actual file paths
             base_path = "/".join(
@@ -101,19 +126,31 @@ class EpubConverter(HtmlConverter):
             markdown_content: List[str] = []
             for file in spine:
                 if file in z.namelist():
-                    with z.open(file) as f:
-                        filename = os.path.basename(file)
-                        extension = os.path.splitext(filename)[1].lower()
-                        mimetype = MIME_TYPE_MAPPING.get(extension)
-                        converted_content = self._html_converter.convert(
-                            f,
-                            StreamInfo(
-                                mimetype=mimetype,
-                                extension=extension,
-                                filename=filename,
-                            ),
+                    try:
+                        with z.open(file) as f:
+                            filename = os.path.basename(file)
+                            extension = os.path.splitext(filename)[1].lower()
+                            mimetype = MIME_TYPE_MAPPING.get(extension)
+                            converted_content = self._html_converter.convert(
+                                f,
+                                StreamInfo(
+                                    mimetype=mimetype,
+                                    extension=extension,
+                                    filename=filename,
+                                ),
+                            )
+                            markdown_content.append(converted_content.markdown.strip())
+                            sections_converted += 1
+                    except Exception as e:
+                        sections_skipped += 1
+                        skipped_files.append(os.path.basename(file))
+                        quality.add_warning(
+                            f"Failed to convert section '{os.path.basename(file)}': {e}",
+                            severity=WarningSeverity.MEDIUM,
                         )
-                        markdown_content.append(converted_content.markdown.strip())
+                else:
+                    sections_skipped += 1
+                    skipped_files.append(os.path.basename(file))
 
             # Format and add the metadata
             metadata_markdown = []
@@ -125,8 +162,69 @@ class EpubConverter(HtmlConverter):
 
             markdown_content.insert(0, "\n".join(metadata_markdown))
 
+            # Build quality report
+            quality.set_metric("sections_detected", sections_detected)
+            quality.set_metric("sections_converted", sections_converted)
+            quality.set_metric("sections_skipped", sections_skipped)
+            quality.set_metric("metadata_fields", metadata_fields_found)
+            quality.set_metric("manifest_items", len(manifest))
+
+            if sections_skipped > 0:
+                quality.add_warning(
+                    f"{sections_skipped} section(s) could not be found or converted: {', '.join(skipped_files[:5])}{'...' if len(skipped_files) > 5 else ''}",
+                    severity=WarningSeverity.MEDIUM,
+                    element_count=sections_skipped,
+                )
+                quality.is_partial = True
+                quality.completion_percentage = (
+                    (sections_converted / sections_detected * 100)
+                    if sections_detected > 0
+                    else 0
+                )
+
+            if not has_title:
+                quality.add_warning(
+                    "EPUB title metadata is missing.",
+                    severity=WarningSeverity.LOW,
+                )
+
+            if not has_authors:
+                quality.add_warning(
+                    "EPUB author metadata is missing.",
+                    severity=WarningSeverity.LOW,
+                )
+
+            # EPUB-specific notes
+            quality.add_warning(
+                "EPUB CSS styling is not preserved in markdown output.",
+                severity=WarningSeverity.INFO,
+                formatting_type=FormattingLossType.CUSTOM_STYLE,
+            )
+
+            quality.add_warning(
+                "Embedded images are not extracted from the EPUB.",
+                severity=WarningSeverity.INFO,
+                formatting_type=FormattingLossType.IMAGE,
+            )
+
+            quality.add_warning(
+                "Table of contents navigation structure is not preserved.",
+                severity=WarningSeverity.INFO,
+                formatting_type=FormattingLossType.TOC,
+            )
+
+            quality.add_formatting_loss(FormattingLossType.PAGE_BREAK)
+            quality.add_formatting_loss(FormattingLossType.FONT_STYLE)
+
+            # Adjust confidence based on conversion success
+            if sections_detected > 0:
+                conversion_ratio = sections_converted / sections_detected
+                quality.confidence = max(0.4, min(0.95, 0.5 + (conversion_ratio * 0.45)))
+
             return DocumentConverterResult(
-                markdown="\n\n".join(markdown_content), title=metadata["title"]
+                markdown="\n\n".join(markdown_content),
+                title=metadata["title"],
+                quality=quality,
             )
 
     def _get_text_from_node(self, dom: Document, tag_name: str) -> str | None:

@@ -4,6 +4,11 @@ import mimetypes
 from ._exiftool import exiftool_metadata
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 ACCEPTED_MIME_TYPE_PREFIXES = [
     "image/jpeg",
@@ -44,12 +49,22 @@ class ImageConverter(DocumentConverter):
     ) -> DocumentConverterResult:
         md_content = ""
 
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.9)
+        metadata_extracted = False
+        llm_description_generated = False
+
         # Add metadata
         metadata = exiftool_metadata(
             file_stream, exiftool_path=kwargs.get("exiftool_path")
         )
 
+        exiftool_available = kwargs.get("exiftool_path") is not None or metadata
+        quality.set_optional_feature("exiftool_metadata", exiftool_available)
+
         if metadata:
+            metadata_extracted = True
+            metadata_fields_found = []
             for f in [
                 "ImageSize",
                 "Title",
@@ -64,11 +79,22 @@ class ImageConverter(DocumentConverter):
             ]:
                 if f in metadata:
                     md_content += f"{f}: {metadata[f]}\n"
+                    metadata_fields_found.append(f)
+
+            quality.set_metric("metadata_fields", metadata_fields_found)
+        else:
+            quality.add_warning(
+                "No metadata could be extracted from the image (exiftool may not be available).",
+                severity=WarningSeverity.LOW,
+            )
 
         # Try describing the image with GPT
         llm_client = kwargs.get("llm_client")
         llm_model = kwargs.get("llm_model")
-        if llm_client is not None and llm_model is not None:
+        llm_available = llm_client is not None and llm_model is not None
+        quality.set_optional_feature("llm_description", llm_available)
+
+        if llm_available:
             llm_description = self._get_llm_description(
                 file_stream,
                 stream_info,
@@ -79,10 +105,34 @@ class ImageConverter(DocumentConverter):
 
             if llm_description is not None:
                 md_content += "\n# Description:\n" + llm_description.strip() + "\n"
+                llm_description_generated = True
+            else:
+                quality.add_warning(
+                    "Failed to generate LLM description for the image.",
+                    severity=WarningSeverity.LOW,
+                    formatting_type=FormattingLossType.IMAGE_DESCRIPTION,
+                )
+        else:
+            quality.add_warning(
+                "LLM client not configured. Image content description not available.",
+                severity=WarningSeverity.MEDIUM,
+                formatting_type=FormattingLossType.IMAGE_DESCRIPTION,
+            )
 
-        return DocumentConverterResult(
-            markdown=md_content,
-        )
+        # Adjust confidence based on what was extracted
+        if not metadata_extracted and not llm_description_generated:
+            quality.confidence = 0.3
+            quality.add_warning(
+                "No metadata or description could be extracted. Output may be empty.",
+                severity=WarningSeverity.HIGH,
+            )
+        elif not llm_description_generated:
+            quality.confidence = 0.6
+
+        quality.set_metric("has_metadata", metadata_extracted)
+        quality.set_metric("has_llm_description", llm_description_generated)
+
+        return DocumentConverterResult(markdown=md_content, quality=quality)
 
     def _get_llm_description(
         self,

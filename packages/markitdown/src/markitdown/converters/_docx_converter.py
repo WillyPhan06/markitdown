@@ -9,6 +9,11 @@ from ..converter_utils.docx.pre_process import pre_process_docx
 from .._base_converter import DocumentConverterResult
 from .._stream_info import StreamInfo
 from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 # Try loading optional (but in this case, required) dependencies
 # Save reporting of any exceptions for later
@@ -84,7 +89,67 @@ class DocxConverter(HtmlConverter):
 
         style_map = kwargs.get("style_map", None)
         pre_process_stream = pre_process_docx(file_stream)
-        return self._html_converter.convert_string(
-            mammoth.convert_to_html(pre_process_stream, style_map=style_map).value,
-            **kwargs,
+
+        # Convert using mammoth and capture any messages
+        mammoth_result = mammoth.convert_to_html(
+            pre_process_stream, style_map=style_map
         )
+        html_content = mammoth_result.value
+        mammoth_messages = mammoth_result.messages
+
+        # Convert HTML to markdown
+        result = self._html_converter.convert_string(html_content, **kwargs)
+
+        # Build quality report
+        quality = ConversionQuality(confidence=0.85)
+
+        # Process mammoth warnings/messages
+        warning_count = 0
+        for msg in mammoth_messages:
+            warning_count += 1
+            msg_text = str(msg)
+
+            # Categorize the warning
+            if "image" in msg_text.lower():
+                quality.add_warning(
+                    msg_text,
+                    severity=WarningSeverity.MEDIUM,
+                    formatting_type=FormattingLossType.IMAGE,
+                )
+            elif "style" in msg_text.lower():
+                quality.add_warning(
+                    msg_text,
+                    severity=WarningSeverity.LOW,
+                    formatting_type=FormattingLossType.CUSTOM_STYLE,
+                )
+            else:
+                quality.add_warning(msg_text, severity=WarningSeverity.LOW)
+
+        # Note about linked resources being disabled
+        quality.add_warning(
+            "Linked images (r:link resources) are not processed.",
+            severity=WarningSeverity.LOW,
+            formatting_type=FormattingLossType.IMAGE,
+        )
+
+        # Common DOCX formatting that may be lost
+        quality.add_warning(
+            "Header and footer content is not extracted.",
+            severity=WarningSeverity.LOW,
+            formatting_type=FormattingLossType.HEADER_FOOTER,
+        )
+
+        quality.add_formatting_loss(FormattingLossType.TEXT_COLOR)
+        quality.add_formatting_loss(FormattingLossType.HIGHLIGHT)
+        quality.add_formatting_loss(FormattingLossType.PAGE_BREAK)
+
+        # Set metrics
+        quality.set_metric("mammoth_warnings", warning_count)
+        quality.set_metric("html_intermediate_length", len(html_content))
+
+        # Adjust confidence based on number of warnings
+        if warning_count > 0:
+            quality.confidence = max(0.5, quality.confidence - (warning_count * 0.05))
+
+        result._quality = quality
+        return result

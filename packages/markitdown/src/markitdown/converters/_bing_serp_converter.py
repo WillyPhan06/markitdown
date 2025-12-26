@@ -8,6 +8,11 @@ from bs4 import BeautifulSoup
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
 from ._markdownify import _CustomMarkdownify
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 ACCEPTED_MIME_TYPE_PREFIXES = [
     "text/html",
@@ -62,6 +67,13 @@ class BingSerpConverter(DocumentConverter):
     ) -> DocumentConverterResult:
         assert stream_info.url is not None
 
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.8)
+        results_detected = 0
+        results_extracted = 0
+        results_with_url = 0
+        url_decode_failures = 0
+
         # Parse the query parameters
         parsed_params = parse_qs(urlparse(stream_info.url).query)
         query = parsed_params.get("q", [""])[0]
@@ -80,11 +92,15 @@ class BingSerpConverter(DocumentConverter):
         # Parse the algorithmic results
         _markdownify = _CustomMarkdownify(**kwargs)
         results = list()
-        for result in soup.find_all(class_="b_algo"):
+        all_results = soup.find_all(class_="b_algo")
+        results_detected = len(all_results)
+
+        for result in all_results:
             if not hasattr(result, "find_all"):
                 continue
 
             # Rewrite redirect urls
+            has_valid_url = False
             for a in result.find_all("a", href=True):
                 parsed_href = urlparse(a["href"])
                 qs = parse_qs(parsed_href.query)
@@ -99,22 +115,73 @@ class BingSerpConverter(DocumentConverter):
                     try:
                         # RFC 4648 / Base64URL" variant, which uses "-" and "_"
                         a["href"] = base64.b64decode(u, altchars="-_").decode("utf-8")
+                        has_valid_url = True
                     except UnicodeDecodeError:
-                        pass
+                        url_decode_failures += 1
                     except binascii.Error:
-                        pass
+                        url_decode_failures += 1
+                else:
+                    # Direct URL, no decoding needed
+                    has_valid_url = True
+
+            if has_valid_url:
+                results_with_url += 1
 
             # Convert to markdown
             md_result = _markdownify.convert_soup(result).strip()
             lines = [line.strip() for line in re.split(r"\n+", md_result)]
-            results.append("\n".join([line for line in lines if len(line) > 0]))
+            result_text = "\n".join([line for line in lines if len(line) > 0])
+            if result_text:
+                results.append(result_text)
+                results_extracted += 1
 
         webpage_text = (
             f"## A Bing search for '{query}' found the following results:\n\n"
             + "\n\n".join(results)
         )
 
+        # Build quality report
+        quality.set_metric("search_query", query)
+        quality.set_metric("results_detected", results_detected)
+        quality.set_metric("results_extracted", results_extracted)
+        quality.set_metric("results_with_url", results_with_url)
+
+        if results_detected == 0:
+            quality.add_warning(
+                "No search results found on the page.",
+                severity=WarningSeverity.HIGH,
+            )
+            quality.confidence = 0.4
+        elif results_extracted < results_detected:
+            skipped = results_detected - results_extracted
+            quality.add_warning(
+                f"{skipped} search result(s) could not be extracted.",
+                severity=WarningSeverity.MEDIUM,
+                element_count=skipped,
+            )
+
+        if url_decode_failures > 0:
+            quality.add_warning(
+                f"{url_decode_failures} URL(s) could not be decoded from Bing redirect format.",
+                severity=WarningSeverity.LOW,
+                formatting_type=FormattingLossType.HYPERLINK,
+                element_count=url_decode_failures,
+            )
+
+        # SERP-specific notes
+        quality.add_warning(
+            "Only organic search results are extracted. Ads, featured snippets, and other elements are excluded.",
+            severity=WarningSeverity.INFO,
+        )
+
+        quality.add_warning(
+            "Rich result features (images, ratings, etc.) may not be fully preserved.",
+            severity=WarningSeverity.INFO,
+            formatting_type=FormattingLossType.EMBEDDED_OBJECT,
+        )
+
         return DocumentConverterResult(
             markdown=webpage_text,
             title=None if soup.title is None else soup.title.string,
+            quality=quality,
         )

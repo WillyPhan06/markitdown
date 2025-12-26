@@ -7,6 +7,11 @@ from typing import BinaryIO, Any
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
 from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 
 # Try loading optional (but in this case, required) dependencies
@@ -72,6 +77,40 @@ class PdfConverter(DocumentConverter):
             )
 
         assert isinstance(file_stream, io.IOBase)  # for mypy
-        return DocumentConverterResult(
-            markdown=pdfminer.high_level.extract_text(file_stream),
+
+        # Extract text from PDF
+        markdown = pdfminer.high_level.extract_text(file_stream)
+
+        # Build quality report for PDF conversion
+        quality = ConversionQuality(confidence=0.7)
+
+        # PDF conversion is essentially plain text extraction - many formatting elements are lost
+        quality.add_warning(
+            "PDF conversion extracts text only. Most style and formatting information is lost.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.FONT_STYLE,
         )
+
+        quality.add_formatting_loss(FormattingLossType.TEXT_COLOR)
+        quality.add_formatting_loss(FormattingLossType.HIGHLIGHT)
+        quality.add_formatting_loss(FormattingLossType.HEADER_FOOTER)
+
+        # Check for potential images (we can't really detect them, but warn about it)
+        quality.add_warning(
+            "Images in the PDF are not extracted or described.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.IMAGE,
+        )
+
+        # Tables in PDFs are typically lost
+        quality.add_warning(
+            "Table structures may not be preserved. Data may appear as plain text.",
+            severity=WarningSeverity.MEDIUM,
+            formatting_type=FormattingLossType.TABLE,
+        )
+
+        # Set metrics about the extraction
+        quality.set_metric("extraction_method", "pdfminer")
+        quality.set_metric("text_length", len(markdown))
+
+        return DocumentConverterResult(markdown=markdown, quality=quality)

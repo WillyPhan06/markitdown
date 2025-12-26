@@ -17,6 +17,12 @@ from ._exceptions import (
     FileConversionException,
     UnsupportedFormatException,
 )
+from ._conversion_quality import (
+    ConversionQuality,
+    ConversionWarning,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 __all__ = [
     "__version__",
@@ -31,4 +37,8 @@ __all__ = [
     "StreamInfo",
     "PRIORITY_SPECIFIC_FILE_FORMAT",
     "PRIORITY_GENERIC_FILE_FORMAT",
+    "ConversionQuality",
+    "ConversionWarning",
+    "FormattingLossType",
+    "WarningSeverity",
 ]

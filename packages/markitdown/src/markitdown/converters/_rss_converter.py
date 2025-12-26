@@ -6,6 +6,11 @@ from bs4 import BeautifulSoup
 from ._markdownify import _CustomMarkdownify
 from .._stream_info import StreamInfo
 from .._base_converter import DocumentConverter, DocumentConverterResult
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 PRECISE_MIME_TYPE_PREFIXES = [
     "application/rss",
@@ -103,31 +108,88 @@ class RssConverter(DocumentConverter):
 
         Returns None if the feed type is not recognized or something goes wrong.
         """
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.85)
+        entries_detected = 0
+        entries_extracted = 0
+        entries_with_title = 0
+        entries_with_content = 0
+        entries_missing_fields = 0
+
         root = doc.getElementsByTagName("feed")[0]
         title = self._get_data_by_tag_name(root, "title")
         subtitle = self._get_data_by_tag_name(root, "subtitle")
         entries = root.getElementsByTagName("entry")
+        entries_detected = len(entries)
+
         md_text = f"# {title}\n"
         if subtitle:
             md_text += f"{subtitle}\n"
+
+        if not title:
+            quality.add_warning(
+                "Feed title is missing.",
+                severity=WarningSeverity.LOW,
+            )
+
         for entry in entries:
             entry_title = self._get_data_by_tag_name(entry, "title")
             entry_summary = self._get_data_by_tag_name(entry, "summary")
             entry_updated = self._get_data_by_tag_name(entry, "updated")
             entry_content = self._get_data_by_tag_name(entry, "content")
 
+            # Track what was found
+            has_content = False
             if entry_title:
+                entries_with_title += 1
                 md_text += f"\n## {entry_title}\n"
             if entry_updated:
                 md_text += f"Updated on: {entry_updated}\n"
             if entry_summary:
                 md_text += self._parse_content(entry_summary)
+                has_content = True
             if entry_content:
                 md_text += self._parse_content(entry_content)
+                has_content = True
+
+            if has_content:
+                entries_with_content += 1
+                entries_extracted += 1
+            elif entry_title:
+                entries_extracted += 1
+                entries_missing_fields += 1
+
+        # Build quality report
+        quality.set_metric("feed_type", "atom")
+        quality.set_metric("entries_detected", entries_detected)
+        quality.set_metric("entries_extracted", entries_extracted)
+        quality.set_metric("entries_with_title", entries_with_title)
+        quality.set_metric("entries_with_content", entries_with_content)
+
+        if entries_detected == 0:
+            quality.add_warning(
+                "No entries found in the Atom feed.",
+                severity=WarningSeverity.HIGH,
+            )
+            quality.confidence = 0.5
+        elif entries_missing_fields > 0:
+            quality.add_warning(
+                f"{entries_missing_fields} entry/entries missing content or summary.",
+                severity=WarningSeverity.LOW,
+                element_count=entries_missing_fields,
+            )
+
+        # Note about formatting
+        quality.add_warning(
+            "Feed entry formatting (images, embedded media) may not be fully preserved.",
+            severity=WarningSeverity.INFO,
+            formatting_type=FormattingLossType.EMBEDDED_OBJECT,
+        )
 
         return DocumentConverterResult(
             markdown=md_text,
             title=title,
+            quality=quality,
         )
 
     def _parse_rss_type(self, doc: Document) -> DocumentConverterResult:
@@ -135,6 +197,14 @@ class RssConverter(DocumentConverter):
 
         Returns None if the feed type is not recognized or something goes wrong.
         """
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.85)
+        items_detected = 0
+        items_extracted = 0
+        items_with_title = 0
+        items_with_content = 0
+        items_missing_fields = 0
+
         root = doc.getElementsByTagName("rss")[0]
         channel_list = root.getElementsByTagName("channel")
         if not channel_list:
@@ -143,28 +213,78 @@ class RssConverter(DocumentConverter):
         channel_title = self._get_data_by_tag_name(channel, "title")
         channel_description = self._get_data_by_tag_name(channel, "description")
         items = channel.getElementsByTagName("item")
+        items_detected = len(items)
+
+        md_text = ""
         if channel_title:
             md_text = f"# {channel_title}\n"
+        else:
+            quality.add_warning(
+                "Channel title is missing.",
+                severity=WarningSeverity.LOW,
+            )
+
         if channel_description:
             md_text += f"{channel_description}\n"
+
         for item in items:
             title = self._get_data_by_tag_name(item, "title")
             description = self._get_data_by_tag_name(item, "description")
             pubDate = self._get_data_by_tag_name(item, "pubDate")
             content = self._get_data_by_tag_name(item, "content:encoded")
 
+            # Track what was found
+            has_content = False
             if title:
+                items_with_title += 1
                 md_text += f"\n## {title}\n"
             if pubDate:
                 md_text += f"Published on: {pubDate}\n"
             if description:
                 md_text += self._parse_content(description)
+                has_content = True
             if content:
                 md_text += self._parse_content(content)
+                has_content = True
+
+            if has_content:
+                items_with_content += 1
+                items_extracted += 1
+            elif title:
+                items_extracted += 1
+                items_missing_fields += 1
+
+        # Build quality report
+        quality.set_metric("feed_type", "rss")
+        quality.set_metric("items_detected", items_detected)
+        quality.set_metric("items_extracted", items_extracted)
+        quality.set_metric("items_with_title", items_with_title)
+        quality.set_metric("items_with_content", items_with_content)
+
+        if items_detected == 0:
+            quality.add_warning(
+                "No items found in the RSS feed.",
+                severity=WarningSeverity.HIGH,
+            )
+            quality.confidence = 0.5
+        elif items_missing_fields > 0:
+            quality.add_warning(
+                f"{items_missing_fields} item(s) missing description or content.",
+                severity=WarningSeverity.LOW,
+                element_count=items_missing_fields,
+            )
+
+        # Note about formatting
+        quality.add_warning(
+            "Feed item formatting (images, embedded media) may not be fully preserved.",
+            severity=WarningSeverity.INFO,
+            formatting_type=FormattingLossType.EMBEDDED_OBJECT,
+        )
 
         return DocumentConverterResult(
             markdown=md_text,
             title=channel_title,
+            quality=quality,
         )
 
     def _parse_content(self, content: str) -> str:

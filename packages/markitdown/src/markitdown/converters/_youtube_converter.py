@@ -7,6 +7,11 @@ from urllib.parse import parse_qs, urlparse, unquote
 
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 # Optional YouTube transcription support
 try:
@@ -73,6 +78,15 @@ class YouTubeConverter(DocumentConverter):
         stream_info: StreamInfo,
         **kwargs: Any,  # Options to pass to the converter
     ) -> DocumentConverterResult:
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.8)
+        has_title = False
+        has_description = False
+        has_transcript = False
+        has_views = False
+        has_runtime = False
+        transcript_error = None
+
         # Parse the stream
         encoding = "utf-8" if stream_info.charset is None else stream_info.charset
         soup = bs4.BeautifulSoup(file_stream, "html.parser", from_encoding=encoding)
@@ -112,8 +126,10 @@ class YouTubeConverter(DocumentConverter):
                             metadata["description"] = str(attrdesc.get("content", ""))
                     break
         except Exception as e:
-            print(f"Error extracting description: {e}")
-            pass
+            quality.add_warning(
+                f"Error extracting full description: {e}",
+                severity=WarningSeverity.LOW,
+            )
 
         # Start preparing the page
         webpage_text = "# YouTube\n"
@@ -122,11 +138,13 @@ class YouTubeConverter(DocumentConverter):
         assert isinstance(title, str)
 
         if title:
+            has_title = True
             webpage_text += f"\n## {title}\n"
 
         stats = ""
         views = self._get(metadata, ["interactionCount"])  # type: ignore
         if views:
+            has_views = True
             stats += f"- **Views:** {views}\n"
 
         keywords = self._get(metadata, ["keywords"])  # type: ignore
@@ -135,6 +153,7 @@ class YouTubeConverter(DocumentConverter):
 
         runtime = self._get(metadata, ["duration"])  # type: ignore
         if runtime:
+            has_runtime = True
             stats += f"- **Runtime:** {runtime}\n"
 
         if len(stats) > 0:
@@ -142,7 +161,11 @@ class YouTubeConverter(DocumentConverter):
 
         description = self._get(metadata, ["description", "og:description"])  # type: ignore
         if description:
+            has_description = True
             webpage_text += f"\n### Description\n{description}\n"
+
+        # Track transcript availability
+        quality.set_optional_feature("youtube_transcript_api", IS_YOUTUBE_TRANSCRIPT_CAPABLE)
 
         if IS_YOUTUBE_TRANSCRIPT_CAPABLE:
             ytt_api = YouTubeTranscriptApi()
@@ -151,12 +174,15 @@ class YouTubeConverter(DocumentConverter):
             params = parse_qs(parsed_url.query)  # type: ignore
             if "v" in params and params["v"][0]:
                 video_id = str(params["v"][0])
-                transcript_list = ytt_api.list(video_id)
-                languages = ["en"]
-                for transcript in transcript_list:
-                    languages.append(transcript.language_code)
-                    break
+                quality.set_metric("video_id", video_id)
+
                 try:
+                    transcript_list = ytt_api.list(video_id)
+                    languages = ["en"]
+                    for transcript in transcript_list:
+                        languages.append(transcript.language_code)
+                        break
+
                     youtube_transcript_languages = kwargs.get(
                         "youtube_transcript_languages", languages
                     )
@@ -174,26 +200,85 @@ class YouTubeConverter(DocumentConverter):
                             [part.text for part in transcript]
                         )  # type: ignore
                 except Exception as e:
-                    # No transcript available
-                    if len(languages) == 1:
-                        print(f"Error fetching transcript: {e}")
-                    else:
-                        # Translate transcript into first kwarg
-                        transcript = (
-                            transcript_list.find_transcript(languages)
-                            .translate(youtube_transcript_languages[0])
-                            .fetch()
-                        )
-                        transcript_text = " ".join([part.text for part in transcript])
-            if transcript_text:
-                webpage_text += f"\n### Transcript\n{transcript_text}\n"
+                    transcript_error = str(e)
+                    # Try translation fallback
+                    try:
+                        if 'transcript_list' in dir() and 'languages' in dir():
+                            transcript = (
+                                transcript_list.find_transcript(languages)
+                                .translate(youtube_transcript_languages[0])
+                                .fetch()
+                            )
+                            transcript_text = " ".join([part.text for part in transcript])
+                            transcript_error = None  # Cleared since fallback worked
+                    except Exception:
+                        pass
+
+                if transcript_text:
+                    has_transcript = True
+                    webpage_text += f"\n### Transcript\n{transcript_text}\n"
+                    quality.set_metric("transcript_length", len(transcript_text))
+        else:
+            quality.add_warning(
+                "youtube_transcript_api not installed. Transcript extraction is disabled.",
+                severity=WarningSeverity.MEDIUM,
+            )
 
         title = title if title else (soup.title.string if soup.title else "")
         assert isinstance(title, str)
 
+        # Build quality report
+        quality.set_metric("has_title", has_title)
+        quality.set_metric("has_description", has_description)
+        quality.set_metric("has_transcript", has_transcript)
+        quality.set_metric("has_views", has_views)
+        quality.set_metric("has_runtime", has_runtime)
+
+        if transcript_error:
+            quality.set_metric("transcript_error", transcript_error)
+            quality.add_warning(
+                f"Transcript could not be fetched: {transcript_error}",
+                severity=WarningSeverity.MEDIUM,
+            )
+
+        if not has_title:
+            quality.add_warning(
+                "Video title could not be extracted.",
+                severity=WarningSeverity.MEDIUM,
+            )
+
+        if not has_description:
+            quality.add_warning(
+                "Video description could not be extracted.",
+                severity=WarningSeverity.LOW,
+            )
+
+        if not has_transcript:
+            if IS_YOUTUBE_TRANSCRIPT_CAPABLE and not transcript_error:
+                quality.add_warning(
+                    "No transcript available for this video.",
+                    severity=WarningSeverity.INFO,
+                )
+            quality.confidence = max(0.5, quality.confidence - 0.2)
+        else:
+            quality.confidence = 0.9
+
+        # YouTube-specific notes
+        quality.add_warning(
+            "Video content itself cannot be converted to markdown. Only metadata and transcript are extracted.",
+            severity=WarningSeverity.INFO,
+            formatting_type=FormattingLossType.VIDEO,
+        )
+
+        quality.add_warning(
+            "Comments and related videos are not extracted.",
+            severity=WarningSeverity.INFO,
+        )
+
         return DocumentConverterResult(
             markdown=webpage_text,
             title=title,
+            quality=quality,
         )
 
     def _get(

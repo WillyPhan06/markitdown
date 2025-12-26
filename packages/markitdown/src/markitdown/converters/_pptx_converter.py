@@ -13,6 +13,11 @@ from ._llm_caption import llm_caption
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
 from .._exceptions import MissingDependencyException, MISSING_DEPENDENCY_MESSAGE
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 # Try loading optional (but in this case, required) dependencies
 # Save reporting of any exceptions for later
@@ -82,6 +87,24 @@ class PptxConverter(DocumentConverter):
         presentation = pptx.Presentation(file_stream)
         md_content = ""
         slide_num = 0
+
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.8)
+        image_count = 0
+        images_with_llm_description = 0
+        images_with_alt_text = 0
+        llm_caption_failures = 0
+        alt_text_failures = 0
+        table_count = 0
+        chart_count = 0
+        unsupported_chart_count = 0
+
+        # Check if LLM is available for image descriptions
+        llm_client = kwargs.get("llm_client")
+        llm_model = kwargs.get("llm_model")
+        llm_available = llm_client is not None and llm_model is not None
+        quality.set_optional_feature("llm_image_description", llm_available)
+
         for slide in presentation.slides:
             slide_num += 1
 
@@ -91,17 +114,20 @@ class PptxConverter(DocumentConverter):
 
             def get_shape_content(shape, **kwargs):
                 nonlocal md_content
+                nonlocal image_count, images_with_llm_description, images_with_alt_text
+                nonlocal llm_caption_failures, alt_text_failures
+                nonlocal table_count, chart_count, unsupported_chart_count
+
                 # Pictures
                 if self._is_picture(shape):
+                    image_count += 1
                     # https://github.com/scanny/python-pptx/pull/512#issuecomment-1713100069
 
                     llm_description = ""
                     alt_text = ""
 
                     # Potentially generate a description using an LLM
-                    llm_client = kwargs.get("llm_client")
-                    llm_model = kwargs.get("llm_model")
-                    if llm_client is not None and llm_model is not None:
+                    if llm_available:
                         # Prepare a file_stream and stream_info for the image data
                         image_filename = shape.image.filename
                         image_extension = None
@@ -124,16 +150,20 @@ class PptxConverter(DocumentConverter):
                                 model=llm_model,
                                 prompt=kwargs.get("llm_prompt"),
                             )
+                            if llm_description:
+                                images_with_llm_description += 1
                         except Exception:
                             # Unable to generate a description
-                            pass
+                            llm_caption_failures += 1
 
                     # Also grab any description embedded in the deck
                     try:
                         alt_text = shape._element._nvXxPr.cNvPr.attrib.get("descr", "")
+                        if alt_text:
+                            images_with_alt_text += 1
                     except Exception:
                         # Unable to get alt text
-                        pass
+                        alt_text_failures += 1
 
                     # Prepare the alt, escaping any special characters
                     alt_text = "\n".join([llm_description, alt_text]) or shape.name
@@ -153,11 +183,16 @@ class PptxConverter(DocumentConverter):
 
                 # Tables
                 if self._is_table(shape):
+                    table_count += 1
                     md_content += self._convert_table_to_markdown(shape.table, **kwargs)
 
                 # Charts
                 if shape.has_chart:
-                    md_content += self._convert_chart_to_markdown(shape.chart)
+                    chart_count += 1
+                    chart_result = self._convert_chart_to_markdown(shape.chart)
+                    if "[unsupported chart]" in chart_result:
+                        unsupported_chart_count += 1
+                    md_content += chart_result
 
                 # Text areas
                 elif shape.has_text_frame:
@@ -197,7 +232,72 @@ class PptxConverter(DocumentConverter):
                     md_content += notes_frame.text
                 md_content = md_content.strip()
 
-        return DocumentConverterResult(markdown=md_content.strip())
+        # Build quality report
+        quality.set_metric("slide_count", slide_num)
+        quality.set_metric("image_count", image_count)
+        quality.set_metric("table_count", table_count)
+        quality.set_metric("chart_count", chart_count)
+
+        # Image-related warnings
+        if image_count > 0:
+            if not llm_available:
+                quality.add_warning(
+                    f"Found {image_count} image(s) but LLM client not configured for descriptions.",
+                    severity=WarningSeverity.LOW,
+                    formatting_type=FormattingLossType.IMAGE_DESCRIPTION,
+                    element_count=image_count,
+                )
+            elif llm_caption_failures > 0:
+                quality.add_warning(
+                    f"Failed to generate LLM descriptions for {llm_caption_failures} image(s).",
+                    severity=WarningSeverity.LOW,
+                    formatting_type=FormattingLossType.IMAGE_DESCRIPTION,
+                    element_count=llm_caption_failures,
+                )
+
+            images_without_description = image_count - max(
+                images_with_llm_description, images_with_alt_text
+            )
+            if images_without_description > 0:
+                quality.add_warning(
+                    f"{images_without_description} image(s) have no description or alt text.",
+                    severity=WarningSeverity.MEDIUM,
+                    formatting_type=FormattingLossType.IMAGE_DESCRIPTION,
+                    element_count=images_without_description,
+                )
+
+        # Chart-related warnings
+        if unsupported_chart_count > 0:
+            quality.add_warning(
+                f"{unsupported_chart_count} chart(s) could not be converted (unsupported type).",
+                severity=WarningSeverity.MEDIUM,
+                formatting_type=FormattingLossType.CHART,
+                element_count=unsupported_chart_count,
+            )
+
+        # Standard PPTX formatting losses
+        quality.add_formatting_loss(FormattingLossType.FONT_STYLE)
+        quality.add_formatting_loss(FormattingLossType.TEXT_COLOR)
+
+        quality.add_warning(
+            "Slide transitions and animations are not preserved.",
+            severity=WarningSeverity.INFO,
+        )
+
+        quality.add_warning(
+            "Speaker notes are extracted but may not include rich formatting.",
+            severity=WarningSeverity.INFO,
+        )
+
+        # Adjust confidence based on issues found
+        if unsupported_chart_count > 0:
+            quality.confidence -= 0.1 * min(unsupported_chart_count, 3)
+        if image_count > 0 and not llm_available:
+            quality.confidence -= 0.05
+
+        quality.confidence = max(0.3, quality.confidence)
+
+        return DocumentConverterResult(markdown=md_content.strip(), quality=quality)
 
     def _is_picture(self, shape):
         if shape.shape_type == pptx.enum.shapes.MSO_SHAPE_TYPE.PICTURE:
