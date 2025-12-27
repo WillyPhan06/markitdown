@@ -2,11 +2,16 @@ import zipfile
 import io
 import os
 
-from typing import BinaryIO, Any, TYPE_CHECKING
+from typing import BinaryIO, Any, TYPE_CHECKING, List
 
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
 from .._exceptions import UnsupportedFormatException, FileConversionException
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 # Break otherwise circular import for type hinting
 if TYPE_CHECKING:
@@ -93,8 +98,27 @@ class ZipConverter(DocumentConverter):
         file_path = stream_info.url or stream_info.local_path or stream_info.filename
         md_content = f"Content from the zip file `{file_path}`:\n\n"
 
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.85)
+
+        # Track file conversion statistics
+        total_files = 0
+        converted_files = 0
+        skipped_directories = 0
+        unsupported_files: List[str] = []
+        failed_files: List[str] = []
+
         with zipfile.ZipFile(file_stream, "r") as zipObj:
-            for name in zipObj.namelist():
+            all_entries = zipObj.namelist()
+
+            for name in all_entries:
+                # Skip directories
+                if name.endswith("/"):
+                    skipped_directories += 1
+                    continue
+
+                total_files += 1
+
                 try:
                     z_file_stream = io.BytesIO(zipObj.read(name))
                     z_file_stream_info = StreamInfo(
@@ -108,9 +132,83 @@ class ZipConverter(DocumentConverter):
                     if result is not None:
                         md_content += f"## File: {name}\n\n"
                         md_content += result.markdown + "\n\n"
+                        converted_files += 1
                 except UnsupportedFormatException:
-                    pass
+                    unsupported_files.append(name)
                 except FileConversionException:
-                    pass
+                    failed_files.append(name)
 
-        return DocumentConverterResult(markdown=md_content.strip())
+        # Build quality report
+        quality.set_metric("total_files", total_files)
+        quality.set_metric("converted_files", converted_files)
+        quality.set_metric("unsupported_files", len(unsupported_files))
+        quality.set_metric("failed_files", len(failed_files))
+        quality.set_metric("skipped_directories", skipped_directories)
+
+        # Calculate completion percentage
+        if total_files > 0:
+            completion = (converted_files / total_files) * 100
+            quality.completion_percentage = completion
+            if converted_files < total_files:
+                quality.is_partial = True
+
+        # Warnings for unsupported files
+        if unsupported_files:
+            quality.add_warning(
+                f"{len(unsupported_files)} file(s) had unsupported formats and were skipped.",
+                severity=WarningSeverity.MEDIUM,
+                element_count=len(unsupported_files),
+                details={"files": unsupported_files[:10]},  # Limit to first 10
+            )
+
+        # Warnings for failed conversions
+        if failed_files:
+            quality.add_warning(
+                f"{len(failed_files)} file(s) failed to convert.",
+                severity=WarningSeverity.HIGH,
+                element_count=len(failed_files),
+                details={"files": failed_files[:10]},  # Limit to first 10
+            )
+
+        # Warning if no files could be converted
+        if total_files > 0 and converted_files == 0:
+            quality.add_warning(
+                "No files in the archive could be converted.",
+                severity=WarningSeverity.HIGH,
+            )
+            quality.confidence = 0.3
+        elif total_files == 0:
+            quality.add_warning(
+                "The archive contains no files.",
+                severity=WarningSeverity.MEDIUM,
+            )
+            quality.confidence = 0.5
+
+        # Confidence Adjustment Formula Explanation:
+        # Base confidence: 0.85 (zip archives have variable content quality)
+        #
+        # Linear scaling formula: confidence = 0.85 * success_rate + 0.15
+        # - success_rate = converted_files / total_files (0.0 to 1.0)
+        # - At 100% success: 0.85 * 1.0 + 0.15 = 1.0 (perfect confidence)
+        # - At 50% success: 0.85 * 0.5 + 0.15 = 0.575 (moderate confidence)
+        # - At 0% success: 0.85 * 0.0 + 0.15 = 0.15 (low confidence, but not zero)
+        # - The +0.15 base ensures we never go below 15% just from success rate,
+        #   acknowledging that even failed conversions provide some value (file listing)
+        #
+        # Additional penalty for failed conversions (vs unsupported):
+        # - Failed files are worse than unsupported files (indicates errors, not just format)
+        # - Penalty: 0.1 * (failed_ratio), capped at 0.3 ratio (max 3% additional reduction)
+        # - This distinguishes between "can't convert .exe" (unsupported) vs "corrupted .docx" (failed)
+        #
+        # Minimum confidence: 0.3 (archive structure was readable)
+        # Maximum confidence: 1.0 (all files converted successfully)
+        if total_files > 0:
+            success_rate = converted_files / total_files
+            quality.confidence = 0.85 * success_rate + 0.15
+
+            if failed_files:
+                quality.confidence -= 0.1 * min(len(failed_files) / total_files, 0.3)
+
+        quality.confidence = max(0.3, min(1.0, quality.confidence))
+
+        return DocumentConverterResult(markdown=md_content.strip(), quality=quality)

@@ -7,6 +7,11 @@ from enum import Enum
 from .._base_converter import DocumentConverter, DocumentConverterResult
 from .._stream_info import StreamInfo
 from .._exceptions import MissingDependencyException
+from .._conversion_quality import (
+    ConversionQuality,
+    FormattingLossType,
+    WarningSeverity,
+)
 
 # Try loading optional (but in this case, required) dependencies
 # Save reporting of any exceptions for later
@@ -240,15 +245,151 @@ class DocumentIntelligenceConverter(DocumentConverter):
         stream_info: StreamInfo,
         **kwargs: Any,  # Options to pass to the converter
     ) -> DocumentConverterResult:
+        # Determine analysis features once and reuse
+        analysis_features = self._analysis_features(stream_info)
+
         # Extract the text using Azure Document Intelligence
         poller = self.doc_intel_client.begin_analyze_document(
             model_id="prebuilt-layout",
             body=AnalyzeDocumentRequest(bytes_source=file_stream.read()),
-            features=self._analysis_features(stream_info),
+            features=analysis_features,
             output_content_format=CONTENT_FORMAT,  # TODO: replace with "ContentFormat.MARKDOWN" when the bug is fixed
         )
         result: AnalyzeResult = poller.result()
 
+        # Quality tracking
+        quality = ConversionQuality(confidence=0.85)
+
+        # Track analysis features used
+        quality.set_optional_feature("ocr_high_resolution", DocumentAnalysisFeature.OCR_HIGH_RESOLUTION in analysis_features if analysis_features else False)
+        quality.set_optional_feature("formula_extraction", DocumentAnalysisFeature.FORMULAS in analysis_features if analysis_features else False)
+        quality.set_optional_feature("style_font_extraction", DocumentAnalysisFeature.STYLE_FONT in analysis_features if analysis_features else False)
+
+        # Track detected elements
+        page_count = len(result.pages) if result.pages else 0
+        table_count = len(result.tables) if result.tables else 0
+        paragraph_count = len(result.paragraphs) if result.paragraphs else 0
+        figure_count = len(result.figures) if hasattr(result, 'figures') and result.figures else 0
+
+        # Track selection marks (form fields like checkboxes)
+        selection_mark_count = 0
+        if result.pages:
+            for page in result.pages:
+                if hasattr(page, 'selection_marks') and page.selection_marks:
+                    selection_mark_count += len(page.selection_marks)
+
+        # Track key-value pairs (form fields)
+        key_value_count = len(result.key_value_pairs) if hasattr(result, 'key_value_pairs') and result.key_value_pairs else 0
+
+        # Set metrics
+        quality.set_metric("page_count", page_count)
+        quality.set_metric("table_count", table_count)
+        quality.set_metric("paragraph_count", paragraph_count)
+        quality.set_metric("figure_count", figure_count)
+        quality.set_metric("selection_mark_count", selection_mark_count)
+        quality.set_metric("key_value_count", key_value_count)
+        quality.set_metric("content_length", len(result.content) if result.content else 0)
+
+        # Analyze tables for potential issues
+        tables_with_issues = 0
+        if result.tables:
+            for table in result.tables:
+                # Check for tables with low confidence or spanning issues
+                if hasattr(table, 'confidence') and table.confidence and table.confidence < 0.8:
+                    tables_with_issues += 1
+
+        # Check for figures/images
+        if figure_count > 0:
+            quality.add_warning(
+                f"{figure_count} figure(s)/image(s) detected. Image content is not fully extractable.",
+                severity=WarningSeverity.MEDIUM,
+                formatting_type=FormattingLossType.IMAGE,
+                element_count=figure_count,
+            )
+            quality.add_formatting_loss(FormattingLossType.IMAGE)
+
+        # Check for tables
+        if table_count > 0:
+            if tables_with_issues > 0:
+                quality.add_warning(
+                    f"{tables_with_issues} table(s) may have been partially converted due to complex structure.",
+                    severity=WarningSeverity.MEDIUM,
+                    formatting_type=FormattingLossType.TABLE,
+                    element_count=tables_with_issues,
+                )
+            else:
+                quality.add_warning(
+                    f"{table_count} table(s) converted. Complex table formatting may be simplified.",
+                    severity=WarningSeverity.INFO,
+                    formatting_type=FormattingLossType.TABLE_FORMATTING,
+                    element_count=table_count,
+                )
+            quality.add_formatting_loss(FormattingLossType.TABLE_FORMATTING)
+
+        # Check for form fields
+        if selection_mark_count > 0:
+            quality.add_warning(
+                f"{selection_mark_count} selection mark(s) (checkboxes/radio buttons) detected but may not be fully preserved.",
+                severity=WarningSeverity.LOW,
+                formatting_type=FormattingLossType.FORM_FIELD,
+                element_count=selection_mark_count,
+            )
+            quality.add_formatting_loss(FormattingLossType.FORM_FIELD)
+
+        if key_value_count > 0:
+            quality.add_warning(
+                f"{key_value_count} form field(s) (key-value pairs) detected.",
+                severity=WarningSeverity.INFO,
+                formatting_type=FormattingLossType.FORM_FIELD,
+                element_count=key_value_count,
+            )
+
+        # Check for empty or minimal content
+        if not result.content or len(result.content.strip()) < 10:
+            quality.add_warning(
+                "Document appears to contain minimal or no extractable text.",
+                severity=WarningSeverity.HIGH,
+            )
+            quality.confidence = 0.4
+
+        # Note about OCR if applicable
+        if analysis_features:
+            quality.add_warning(
+                "OCR was used for text extraction. Accuracy depends on document quality.",
+                severity=WarningSeverity.INFO,
+            )
+
+        # Standard formatting losses for Document Intelligence
+        quality.add_formatting_loss(FormattingLossType.FONT_STYLE)
+        quality.add_formatting_loss(FormattingLossType.TEXT_COLOR)
+        quality.add_formatting_loss(FormattingLossType.HEADER_FOOTER)
+
+        # Confidence Adjustment Formula Explanation:
+        # Base confidence: 0.85 (Document Intelligence is generally reliable but has limitations)
+        #
+        # Special case for minimal/empty content (applied above): set to 0.4
+        # - If the document has < 10 characters, OCR likely failed or document is empty
+        # - This overrides other calculations as it indicates fundamental failure
+        #
+        # Penalty for tables with issues:
+        # - Tables with confidence < 0.8 from the API indicate complex or poorly recognized tables
+        # - Penalty: 0.05 per problematic table, capped at 3 tables (max 15% reduction)
+        # - Capped because table issues don't compound indefinitely; user is already warned
+        #
+        # Penalty for figures/images:
+        # - Images cannot have their visual content extracted (only detected)
+        # - Penalty: 0.05 per figure, capped at 3 figures (max 15% reduction)
+        # - Capped because missing images is a known limitation, not a conversion failure
+        #
+        # Minimum confidence: 0.3 (document was processed, some structure extracted)
+        if tables_with_issues > 0:
+            quality.confidence -= 0.05 * min(tables_with_issues, 3)
+
+        if figure_count > 0:
+            quality.confidence -= 0.05 * min(figure_count, 3)
+
+        quality.confidence = max(0.3, quality.confidence)
+
         # remove comments from the markdown content generated by Doc Intelligence and append to markdown string
         markdown_text = re.sub(r"<!--.*?-->", "", result.content, flags=re.DOTALL)
-        return DocumentConverterResult(markdown=markdown_text)
+        return DocumentConverterResult(markdown=markdown_text, quality=quality)
