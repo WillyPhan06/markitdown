@@ -7,7 +7,7 @@ import traceback
 import io
 from dataclasses import dataclass
 from importlib.metadata import entry_points
-from typing import Any, List, Dict, Optional, Union, BinaryIO
+from typing import Any, Callable, List, Dict, Optional, Union, BinaryIO
 from pathlib import Path
 from urllib.parse import urlparse
 from warnings import warn
@@ -48,6 +48,15 @@ from ._exceptions import (
     FileConversionException,
     UnsupportedFormatException,
     FailedConversionAttempt,
+)
+
+from ._batch import (
+    BatchConversionResult,
+    BatchItemResult,
+    BatchItemStatus,
+    convert_batch as _convert_batch,
+    convert_directory as _convert_directory,
+    write_batch_results,
 )
 
 
@@ -528,6 +537,122 @@ class MarkItDown:
             file_stream=buffer, base_guess=base_guess
         )
         return self._convert(file_stream=buffer, stream_info_guesses=guesses, **kwargs)
+
+    def convert_batch(
+        self,
+        sources: List[Union[str, Path]],
+        *,
+        stream_info: Optional[StreamInfo] = None,
+        max_workers: Optional[int] = None,
+        on_progress: Optional[Callable[[BatchItemResult], None]] = None,
+        skip_errors: bool = True,
+        **kwargs: Any,
+    ) -> BatchConversionResult:
+        """
+        Convert multiple files to markdown.
+
+        This method allows batch conversion of multiple files in parallel,
+        with progress tracking and quality reporting for each file.
+
+        Args:
+            sources: List of file paths or URLs to convert.
+            stream_info: Optional stream info hints for all files.
+            max_workers: Maximum number of parallel workers. Defaults to min(32, cpu_count + 4).
+                        Set to 1 for sequential processing.
+            on_progress: Optional callback called after each file is processed.
+                        Receives a BatchItemResult with the conversion result.
+            skip_errors: If True (default), continue processing on errors.
+                        If False, raise an exception on first error.
+            **kwargs: Additional arguments passed to each conversion.
+
+        Returns:
+            BatchConversionResult containing results for all files, including:
+            - Individual results for each file with quality information
+            - Aggregated statistics (success/fail counts, completion percentage)
+            - Overall quality report combining all conversions
+
+        Example:
+            >>> md = MarkItDown()
+            >>> result = md.convert_batch([
+            ...     "document.pdf",
+            ...     "spreadsheet.xlsx",
+            ...     "presentation.pptx"
+            ... ])
+            >>> print(f"Converted {result.success_count}/{result.total_count} files")
+            >>> for item in result.successful_items:
+            ...     print(f"{item.source_path}: {item.quality.confidence:.0%} confidence")
+        """
+        return _convert_batch(
+            self,
+            sources,
+            stream_info=stream_info,
+            max_workers=max_workers,
+            on_progress=on_progress,
+            skip_errors=skip_errors,
+            **kwargs,
+        )
+
+    def convert_directory(
+        self,
+        directory: Union[str, Path],
+        *,
+        glob_pattern: str = "*",
+        recursive: bool = True,
+        include_patterns: Optional[List[str]] = None,
+        exclude_patterns: Optional[List[str]] = None,
+        stream_info: Optional[StreamInfo] = None,
+        max_workers: Optional[int] = None,
+        on_progress: Optional[Callable[[BatchItemResult], None]] = None,
+        skip_errors: bool = True,
+        **kwargs: Any,
+    ) -> BatchConversionResult:
+        """
+        Convert all files in a directory to markdown.
+
+        This method scans a directory for files matching specified patterns
+        and converts them all, with optional parallel processing.
+
+        Args:
+            directory: Path to the directory to convert.
+            glob_pattern: Glob pattern to match files (default: "*" for all files).
+            recursive: If True (default), search subdirectories recursively.
+            include_patterns: List of glob patterns for files to include.
+                            Example: ["*.pdf", "*.docx", "*.xlsx"]
+            exclude_patterns: List of glob patterns for files to exclude.
+                            Example: ["*.tmp", ".*", "__pycache__/*"]
+            stream_info: Optional stream info hints for all files.
+            max_workers: Maximum number of parallel workers.
+            on_progress: Optional callback called after each file is processed.
+            skip_errors: If True (default), continue processing on errors.
+            **kwargs: Additional arguments passed to each conversion.
+
+        Returns:
+            BatchConversionResult containing results for all files.
+
+        Example:
+            >>> md = MarkItDown()
+            >>> # Convert all PDF and DOCX files in a directory
+            >>> result = md.convert_directory(
+            ...     "/path/to/documents",
+            ...     include_patterns=["*.pdf", "*.docx"],
+            ...     exclude_patterns=["*.tmp"]
+            ... )
+            >>> print(result)  # Shows summary
+            >>> print(result.overall_quality)  # Shows aggregated quality report
+        """
+        return _convert_directory(
+            self,
+            directory,
+            glob_pattern=glob_pattern,
+            recursive=recursive,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
+            stream_info=stream_info,
+            max_workers=max_workers,
+            on_progress=on_progress,
+            skip_errors=skip_errors,
+            **kwargs,
+        )
 
     def _convert(
         self, *, file_stream: BinaryIO, stream_info_guesses: List[StreamInfo], **kwargs

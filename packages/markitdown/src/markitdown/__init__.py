@@ -23,6 +23,14 @@ from ._conversion_quality import (
     FormattingLossType,
     WarningSeverity,
 )
+from ._batch import (
+    BatchConversionResult,
+    BatchItemResult,
+    BatchItemStatus,
+    convert_batch,
+    convert_directory,
+    write_batch_results,
+)
 
 __all__ = [
     "__version__",
@@ -41,4 +49,11 @@ __all__ = [
     "ConversionWarning",
     "FormattingLossType",
     "WarningSeverity",
+    # Batch conversion
+    "BatchConversionResult",
+    "BatchItemResult",
+    "BatchItemStatus",
+    "convert_batch",
+    "convert_directory",
+    "write_batch_results",
 ]
