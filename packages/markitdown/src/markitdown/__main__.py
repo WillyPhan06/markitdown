@@ -63,6 +63,17 @@ def main():
 
                 # Show progress during batch conversion
                 markitdown --batch /path/to/documents --progress
+
+            CACHING EXAMPLES:
+
+                # Enable caching to skip unchanged files on re-runs
+                markitdown --batch /path/to/documents --cache --progress
+
+                # Use a custom cache directory
+                markitdown --batch /path/to/documents --cache-dir /tmp/my-cache
+
+                # Clear the cache
+                markitdown --clear-cache
             """
         ).strip(),
     )
@@ -233,6 +244,38 @@ def main():
         ),
     )
 
+    # Cache arguments
+    parser.add_argument(
+        "--cache",
+        action="store_true",
+        help=(
+            "Enable caching for batch conversions. When enabled, conversion results "
+            "are cached based on file content hash (SHA-256). Subsequent batch runs "
+            "will skip files that haven't changed and use cached results instead. "
+            "This can significantly speed up repeated batch conversions when only "
+            "some files have changed. Cache is stored in ~/.cache/markitdown by default."
+        ),
+    )
+
+    parser.add_argument(
+        "--cache-dir",
+        type=str,
+        metavar="PATH",
+        help=(
+            "Directory to store cache files. Defaults to ~/.cache/markitdown. "
+            "Implies --cache if specified."
+        ),
+    )
+
+    parser.add_argument(
+        "--clear-cache",
+        action="store_true",
+        help=(
+            "Clear all cached conversion results and exit. Use this to free up "
+            "disk space or to force re-conversion of all files on next batch run."
+        ),
+    )
+
     parser.add_argument("filename", nargs="*")
     args = parser.parse_args()
 
@@ -293,6 +336,16 @@ def main():
             print(
                 "\nUse the -p (or --use-plugins) option to enable 3rd-party plugins.\n"
             )
+        sys.exit(0)
+
+    if args.clear_cache:
+        # Clear cache and exit
+        from ._cache import ConversionCache
+
+        cache_dir = Path(args.cache_dir) if args.cache_dir else None
+        cache = ConversionCache(cache_dir)
+        count = cache.clear()
+        print(f"Cleared {count} cached conversion(s) from {cache.cache_dir}")
         sys.exit(0)
 
     if args.use_docintel:
@@ -419,6 +472,16 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
     if not args.filename:
         _exit_with_error("Batch mode requires at least one file or directory path.")
 
+    # Set up cache if enabled (--cache or --cache-dir implies caching)
+    cache = None
+    if args.cache or args.cache_dir:
+        from ._cache import ConversionCache
+
+        cache_dir = Path(args.cache_dir) if args.cache_dir else None
+        cache = ConversionCache(cache_dir)
+        if args.progress:
+            print(f"Cache enabled: {cache.cache_dir}", file=sys.stderr)
+
     # Step 2: Set up thread-safe progress callback
     # We use a threading.Lock to prevent interleaved output when multiple worker threads
     # complete conversions at nearly the same time. Without this, parallel execution could
@@ -438,6 +501,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                 # Map status to visual icon for quick scanning of output
                 status_icon = {
                     BatchItemStatus.SUCCESS: "✓",
+                    BatchItemStatus.CACHED: "⚡",  # Lightning bolt for cached (fast)
                     BatchItemStatus.FAILED: "✗",
                     BatchItemStatus.SKIPPED: "○",
                     BatchItemStatus.UNSUPPORTED: "?",
@@ -452,8 +516,10 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                 # Show confidence percentage for successful conversions
                 # This gives users immediate feedback on conversion quality
                 confidence_str = ""
-                if item.quality and item.status == BatchItemStatus.SUCCESS:
+                if item.quality and item.status in (BatchItemStatus.SUCCESS, BatchItemStatus.CACHED):
                     confidence_str = f" ({item.quality.confidence:.0%})"
+                if item.status == BatchItemStatus.CACHED:
+                    confidence_str += " [cached]"
 
                 # Print to stderr (not stdout) so it doesn't mix with converted content
                 # flush=True ensures immediate output even when stderr is piped/redirected
@@ -480,6 +546,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
             max_workers=args.parallel,
             on_progress=progress_callback,
             keep_data_uris=args.keep_data_uris if hasattr(args, "keep_data_uris") else False,
+            cache=cache,
         )
     else:
         # Mixed mode: user provided multiple files and/or directories
@@ -537,6 +604,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
             max_workers=args.parallel,
             on_progress=progress_callback,
             keep_data_uris=args.keep_data_uris if hasattr(args, "keep_data_uris") else False,
+            cache=cache,
         )
 
     # Step 6: Handle output based on --output flag

@@ -7,7 +7,7 @@ import traceback
 import io
 from dataclasses import dataclass
 from importlib.metadata import entry_points
-from typing import Any, Callable, List, Dict, Optional, Union, BinaryIO
+from typing import Any, Callable, List, Dict, Optional, Union, BinaryIO, TYPE_CHECKING
 from pathlib import Path
 from urllib.parse import urlparse
 from warnings import warn
@@ -15,6 +15,9 @@ import requests
 import magika
 import charset_normalizer
 import codecs
+
+if TYPE_CHECKING:
+    from ._cache import ConversionCache
 
 from ._stream_info import StreamInfo
 from ._uri_utils import parse_data_uri, file_uri_to_path
@@ -546,6 +549,7 @@ class MarkItDown:
         max_workers: Optional[int] = None,
         on_progress: Optional[Callable[[BatchItemResult], None]] = None,
         skip_errors: bool = True,
+        cache: Optional["ConversionCache"] = None,
         **kwargs: Any,
     ) -> BatchConversionResult:
         """
@@ -563,6 +567,8 @@ class MarkItDown:
                         Receives a BatchItemResult with the conversion result.
             skip_errors: If True (default), continue processing on errors.
                         If False, raise an exception on first error.
+            cache: Optional ConversionCache instance for caching results. When provided,
+                   unchanged files will be retrieved from cache instead of re-converting.
             **kwargs: Additional arguments passed to each conversion.
 
         Returns:
@@ -589,6 +595,7 @@ class MarkItDown:
             max_workers=max_workers,
             on_progress=on_progress,
             skip_errors=skip_errors,
+            cache=cache,
             **kwargs,
         )
 
@@ -604,6 +611,7 @@ class MarkItDown:
         max_workers: Optional[int] = None,
         on_progress: Optional[Callable[[BatchItemResult], None]] = None,
         skip_errors: bool = True,
+        cache: Optional["ConversionCache"] = None,
         **kwargs: Any,
     ) -> BatchConversionResult:
         """
@@ -624,6 +632,7 @@ class MarkItDown:
             max_workers: Maximum number of parallel workers.
             on_progress: Optional callback called after each file is processed.
             skip_errors: If True (default), continue processing on errors.
+            cache: Optional ConversionCache instance for caching results.
             **kwargs: Additional arguments passed to each conversion.
 
         Returns:
@@ -651,6 +660,7 @@ class MarkItDown:
             max_workers=max_workers,
             on_progress=on_progress,
             skip_errors=skip_errors,
+            cache=cache,
             **kwargs,
         )
 

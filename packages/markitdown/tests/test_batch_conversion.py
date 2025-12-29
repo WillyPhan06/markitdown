@@ -716,6 +716,8 @@ class TestHandleBatchConversion:
             quality_json=False,
             summary=False,
             keep_data_uris=False,
+            cache=False,
+            cache_dir=None,
         )
 
         markitdown = MarkItDown()
@@ -747,6 +749,8 @@ class TestHandleBatchConversion:
             quality_json=False,
             summary=False,
             keep_data_uris=False,
+            cache=False,
+            cache_dir=None,
         )
 
         markitdown = MarkItDown()
@@ -772,6 +776,8 @@ class TestHandleBatchConversion:
             quality_json=False,
             summary=False,
             keep_data_uris=False,
+            cache=False,
+            cache_dir=None,
         )
 
         markitdown = MarkItDown()
@@ -802,6 +808,8 @@ class TestHandleBatchConversion:
             quality_json=False,
             summary=False,
             keep_data_uris=False,
+            cache=False,
+            cache_dir=None,
         )
 
         markitdown = MarkItDown()

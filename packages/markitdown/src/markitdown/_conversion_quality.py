@@ -208,6 +208,63 @@ class ConversionQuality:
             "completion_percentage": self.completion_percentage,
         }
 
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ConversionQuality":
+        """
+        Create a ConversionQuality from a dictionary.
+
+        Args:
+            data: Dictionary representation (as produced by to_dict()).
+
+        Returns:
+            A new ConversionQuality instance.
+        """
+        # Reconstruct warnings
+        warnings = []
+        for w_data in data.get("warnings", []):
+            formatting_type = None
+            if w_data.get("formatting_type"):
+                try:
+                    formatting_type = FormattingLossType(w_data["formatting_type"])
+                except ValueError:
+                    pass  # Unknown formatting type, skip
+
+            severity = WarningSeverity.LOW
+            if w_data.get("severity"):
+                try:
+                    severity = WarningSeverity(w_data["severity"])
+                except ValueError:
+                    pass  # Unknown severity, use default
+
+            warnings.append(
+                ConversionWarning(
+                    message=w_data.get("message", ""),
+                    severity=severity,
+                    formatting_type=formatting_type,
+                    element_count=w_data.get("element_count"),
+                    details=w_data.get("details"),
+                )
+            )
+
+        # Reconstruct formatting_loss
+        formatting_loss = []
+        for loss_value in data.get("formatting_loss", []):
+            try:
+                formatting_loss.append(FormattingLossType(loss_value))
+            except ValueError:
+                pass  # Unknown loss type, skip
+
+        return cls(
+            confidence=data.get("confidence", 1.0),
+            warnings=warnings,
+            formatting_loss=formatting_loss,
+            metrics=data.get("metrics", {}),
+            converter_used=data.get("converter_used"),
+            optional_features_used=data.get("optional_features_used", {}),
+            is_partial=data.get("is_partial", False),
+            completion_percentage=data.get("completion_percentage"),
+        )
+
     def __str__(self) -> str:
         """Return a human-readable summary."""
         lines = []

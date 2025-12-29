@@ -31,6 +31,7 @@ from ._batch import (
     convert_directory,
     write_batch_results,
 )
+from ._cache import ConversionCache
 
 __all__ = [
     "__version__",
@@ -56,4 +57,6 @@ __all__ = [
     "convert_batch",
     "convert_directory",
     "write_batch_results",
+    # Caching
+    "ConversionCache",
 ]

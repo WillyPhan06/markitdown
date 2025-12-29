@@ -28,6 +28,7 @@ from typing import (
 
 if TYPE_CHECKING:
     from ._markitdown import MarkItDown
+    from ._cache import ConversionCache
 
 from ._base_converter import DocumentConverterResult
 from ._conversion_quality import ConversionQuality, WarningSeverity
@@ -41,6 +42,7 @@ class BatchItemStatus(Enum):
     FAILED = "failed"
     SKIPPED = "skipped"
     UNSUPPORTED = "unsupported"
+    CACHED = "cached"  # Retrieved from cache without re-conversion
 
 
 @dataclass
@@ -96,8 +98,16 @@ class BatchConversionResult:
 
     @property
     def success_count(self) -> int:
-        """Number of successfully converted files."""
-        return sum(1 for item in self.items if item.status == BatchItemStatus.SUCCESS)
+        """Number of successfully converted files (including cached)."""
+        return sum(
+            1 for item in self.items
+            if item.status in (BatchItemStatus.SUCCESS, BatchItemStatus.CACHED)
+        )
+
+    @property
+    def cached_count(self) -> int:
+        """Number of files retrieved from cache."""
+        return sum(1 for item in self.items if item.status == BatchItemStatus.CACHED)
 
     @property
     def failed_count(self) -> int:
@@ -118,8 +128,16 @@ class BatchConversionResult:
 
     @property
     def successful_items(self) -> List[BatchItemResult]:
-        """Get all successfully converted items."""
-        return [item for item in self.items if item.status == BatchItemStatus.SUCCESS]
+        """Get all successfully converted items (including cached)."""
+        return [
+            item for item in self.items
+            if item.status in (BatchItemStatus.SUCCESS, BatchItemStatus.CACHED)
+        ]
+
+    @property
+    def cached_items(self) -> List[BatchItemResult]:
+        """Get all items retrieved from cache."""
+        return [item for item in self.items if item.status == BatchItemStatus.CACHED]
 
     @property
     def failed_items(self) -> List[BatchItemResult]:
@@ -223,6 +241,7 @@ class BatchConversionResult:
             "source_directory": self.source_directory,
             "total_count": self.total_count,
             "success_count": self.success_count,
+            "cached_count": self.cached_count,
             "failed_count": self.failed_count,
             "skipped_count": self.skipped_count,
             "unsupported_count": self.unsupported_count,
@@ -243,6 +262,8 @@ class BatchConversionResult:
 
         lines.append(f"Total files: {self.total_count}")
         lines.append(f"  Successful: {self.success_count}")
+        if self.cached_count > 0:
+            lines.append(f"    (from cache: {self.cached_count})")
         lines.append(f"  Failed: {self.failed_count}")
         lines.append(f"  Skipped: {self.skipped_count}")
         lines.append(f"  Unsupported: {self.unsupported_count}")
@@ -256,10 +277,36 @@ class BatchConversionResult:
             ) / len(self.successful_items)
             lines.append(f"Average confidence: {avg_confidence:.0%}")
 
+        # Show converted files (newly processed, not from cache)
+        newly_converted = [
+            item for item in self.items if item.status == BatchItemStatus.SUCCESS
+        ]
+        if newly_converted:
+            lines.append("\nNewly converted files:")
+            for item in newly_converted[:10]:  # Show first 10
+                confidence_str = ""
+                if item.quality:
+                    confidence_str = f" ({item.quality.confidence:.0%})"
+                lines.append(f"  ✓ {item.source_path}{confidence_str}")
+            if len(newly_converted) > 10:
+                lines.append(f"  ... and {len(newly_converted) - 10} more")
+
+        # Show cached files (loaded from cache, not re-converted)
+        if self.cached_items:
+            lines.append("\nFiles loaded from cache (unchanged):")
+            for item in self.cached_items[:10]:  # Show first 10
+                confidence_str = ""
+                if item.quality:
+                    confidence_str = f" ({item.quality.confidence:.0%})"
+                lines.append(f"  ⚡ {item.source_path}{confidence_str}")
+            if len(self.cached_items) > 10:
+                lines.append(f"  ... and {len(self.cached_items) - 10} more")
+
+        # Show failed files
         if self.failed_items:
             lines.append("\nFailed files:")
             for item in self.failed_items[:10]:  # Show first 10
-                lines.append(f"  - {item.source_path}: {item.error}")
+                lines.append(f"  ✗ {item.source_path}: {item.error}")
             if len(self.failed_items) > 10:
                 lines.append(f"  ... and {len(self.failed_items) - 10} more")
 
@@ -275,6 +322,7 @@ def convert_batch(
     max_workers: Optional[int] = None,
     on_progress: Optional[Callable[[BatchItemResult], None]] = None,
     skip_errors: bool = True,
+    cache: Optional["ConversionCache"] = None,
     **kwargs: Any,
 ) -> BatchConversionResult:
     """
@@ -287,6 +335,8 @@ def convert_batch(
         max_workers: Maximum number of parallel workers. Defaults to min(32, cpu_count + 4).
         on_progress: Optional callback called after each file is processed.
         skip_errors: If True, continue processing on errors. If False, raise on first error.
+        cache: Optional ConversionCache instance for caching results. When provided,
+               unchanged files will be retrieved from cache instead of re-converting.
         **kwargs: Additional arguments passed to each conversion.
 
     Returns:
@@ -296,10 +346,38 @@ def convert_batch(
 
     def convert_single(source: Union[str, Path]) -> BatchItemResult:
         source_str = str(source)
+        source_path = Path(source_str)
+
+        # Check cache first (only for local files)
+        if cache is not None and source_path.is_file():
+            try:
+                cache_entry = cache.get(source_str)
+                if cache_entry is not None:
+                    from ._cache import cache_entry_to_result
+
+                    conversion_result = cache_entry_to_result(cache_entry)
+                    return BatchItemResult(
+                        source_path=source_str,
+                        status=BatchItemStatus.CACHED,
+                        result=conversion_result,
+                    )
+            except Exception:
+                # Cache read failed, proceed with conversion
+                pass
+
         try:
             conversion_result = markitdown.convert(
                 source_str, stream_info=stream_info, **kwargs
             )
+
+            # Store in cache (only for local files)
+            if cache is not None and source_path.is_file():
+                try:
+                    cache.put(source_str, conversion_result)
+                except Exception:
+                    # Cache write failed, ignore
+                    pass
+
             return BatchItemResult(
                 source_path=source_str,
                 status=BatchItemStatus.SUCCESS,
@@ -367,6 +445,7 @@ def convert_directory(
     max_workers: Optional[int] = None,
     on_progress: Optional[Callable[[BatchItemResult], None]] = None,
     skip_errors: bool = True,
+    cache: Optional["ConversionCache"] = None,
     **kwargs: Any,
 ) -> BatchConversionResult:
     """
@@ -383,6 +462,7 @@ def convert_directory(
         max_workers: Maximum number of parallel workers.
         on_progress: Optional callback called after each file is processed.
         skip_errors: If True, continue processing on errors.
+        cache: Optional ConversionCache instance for caching results.
         **kwargs: Additional arguments passed to each conversion.
 
     Returns:
@@ -430,6 +510,7 @@ def convert_directory(
         max_workers=max_workers,
         on_progress=on_progress,
         skip_errors=skip_errors,
+        cache=cache,
         **kwargs,
     )
     result.source_directory = str(directory)
