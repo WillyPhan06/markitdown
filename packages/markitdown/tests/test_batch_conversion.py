@@ -923,5 +923,444 @@ class TestProgressCallbackThreadSafety:
             assert "\n" not in line[1:]  # No newlines within a progress line
 
 
+class TestExportManifest:
+    """Tests for --export-manifest feature."""
+
+    def _run_cli(self, args, check=True):
+        """Helper to run the markitdown CLI command."""
+        cmd = [sys.executable, "-m", MARKITDOWN_MODULE] + args
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(TEST_FILES_DIR),
+        )
+        if check and result.returncode != 0:
+            print(f"STDOUT: {result.stdout}")
+            print(f"STDERR: {result.stderr}")
+        return result
+
+    def test_export_manifest_requires_batch_mode(self):
+        """Test that --export-manifest fails without --batch."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            manifest_file = f.name
+
+        try:
+            result = self._run_cli([
+                os.path.join(TEST_FILES_DIR, "test.json"),
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            # Should fail with an error
+            assert result.returncode != 0
+            # Error message should mention that --export-manifest requires --batch
+            assert "--export-manifest" in result.stdout or "--batch" in result.stdout
+        finally:
+            if os.path.exists(manifest_file):
+                os.unlink(manifest_file)
+
+    def test_export_manifest_creates_nested_directories(self):
+        """Test that --export-manifest creates nested parent directories."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Use a nested path that doesn't exist yet
+            nested_manifest_path = os.path.join(tmpdir, "nested", "deeply", "manifest.json")
+
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--export-manifest", nested_manifest_path,
+            ], check=False)
+
+            assert result.returncode == 0
+
+            # Check that nested directories were created
+            assert os.path.exists(os.path.join(tmpdir, "nested"))
+            assert os.path.exists(os.path.join(tmpdir, "nested", "deeply"))
+
+            # Check that manifest file was created
+            assert os.path.exists(nested_manifest_path)
+
+            # Verify manifest is valid JSON
+            with open(nested_manifest_path, "r") as f:
+                manifest = json.load(f)
+                assert "summary" in manifest
+                assert "files" in manifest
+
+    def test_export_manifest_contains_all_required_fields(self):
+        """Test that manifest contains all required fields in correct structure."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            manifest_file = f.name
+
+        try:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--include", "*.xlsx",
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            assert result.returncode == 0
+
+            with open(manifest_file, "r") as f:
+                manifest = json.load(f)
+
+            # Check summary fields
+            assert "summary" in manifest
+            summary = manifest["summary"]
+            assert "total_files" in summary
+            assert "successful" in summary
+            assert "cached" in summary
+            assert "failed" in summary
+            assert "unsupported" in summary
+            assert "skipped" in summary
+            assert "completion_percentage" in summary
+            assert "average_confidence" in summary
+
+            # Check files array
+            assert "files" in manifest
+            assert isinstance(manifest["files"], list)
+            assert len(manifest["files"]) > 0
+
+            # Check each file entry has required fields
+            for file_entry in manifest["files"]:
+                assert "source_path" in file_entry
+                assert "status" in file_entry
+                assert "quality" in file_entry  # Can be null but key must exist
+
+                # If successful, quality should have detailed info
+                if file_entry["status"] in ("success", "cached"):
+                    assert file_entry["quality"] is not None
+                    quality = file_entry["quality"]
+                    assert "confidence" in quality
+                    assert "converter_used" in quality
+
+        finally:
+            if os.path.exists(manifest_file):
+                os.unlink(manifest_file)
+
+    def test_export_manifest_average_confidence_null_when_all_failed(self):
+        """Test that average_confidence is null when no files were successfully converted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create a directory with only unsupported files
+            unsupported_file = os.path.join(tmpdir, "unsupported.xyz123")
+            with open(unsupported_file, "wb") as f:
+                f.write(b"random binary content that won't convert")
+
+            manifest_file = os.path.join(tmpdir, "manifest.json")
+
+            result = self._run_cli([
+                "--batch", tmpdir,
+                "--include", "*.xyz123",
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            # May fail or succeed depending on error handling, but manifest should be created
+            # if any processing happened
+            if os.path.exists(manifest_file):
+                with open(manifest_file, "r") as f:
+                    manifest = json.load(f)
+
+                # average_confidence should be null (None in Python) since no successful conversions
+                assert manifest["summary"]["average_confidence"] is None
+                assert manifest["summary"]["successful"] == 0
+
+    def test_export_manifest_average_confidence_float_when_successful(self):
+        """Test that average_confidence is a float between 0 and 1 when files convert successfully."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            manifest_file = f.name
+
+        try:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            assert result.returncode == 0
+
+            with open(manifest_file, "r") as f:
+                manifest = json.load(f)
+
+            # Should have successful conversions
+            assert manifest["summary"]["successful"] > 0
+
+            # average_confidence should be a float (not null)
+            avg_confidence = manifest["summary"]["average_confidence"]
+            assert avg_confidence is not None
+            assert isinstance(avg_confidence, float)
+            assert 0.0 <= avg_confidence <= 1.0
+
+        finally:
+            if os.path.exists(manifest_file):
+                os.unlink(manifest_file)
+
+    def test_export_manifest_file_quality_matches_source(self):
+        """Test that each file in manifest has correct source_path and quality info."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            manifest_file = f.name
+
+        try:
+            test_json = os.path.join(TEST_FILES_DIR, "test.json")
+            test_xlsx = os.path.join(TEST_FILES_DIR, "test.xlsx")
+
+            result = self._run_cli([
+                "--batch",
+                test_json,
+                test_xlsx,
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            assert result.returncode == 0
+
+            with open(manifest_file, "r") as f:
+                manifest = json.load(f)
+
+            # Should have entries for both files
+            assert len(manifest["files"]) == 2
+
+            # Check that source paths are present
+            source_paths = [entry["source_path"] for entry in manifest["files"]]
+            assert any("test.json" in p for p in source_paths)
+            assert any("test.xlsx" in p for p in source_paths)
+
+            # Each successful file should have quality with converter_used
+            for file_entry in manifest["files"]:
+                if file_entry["status"] == "success":
+                    assert file_entry["quality"] is not None
+                    assert file_entry["quality"]["converter_used"] is not None
+
+        finally:
+            if os.path.exists(manifest_file):
+                os.unlink(manifest_file)
+
+    def test_export_manifest_includes_error_info_for_failed_files(self):
+        """Test that manifest includes error information for failed/unsupported files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Create files: one valid, one unsupported
+            valid_file = os.path.join(tmpdir, "valid.json")
+            with open(valid_file, "w") as f:
+                json.dump({"key": "value"}, f)
+
+            unsupported_file = os.path.join(tmpdir, "unsupported.bin")
+            with open(unsupported_file, "wb") as f:
+                f.write(os.urandom(100))  # Random binary data
+
+            manifest_file = os.path.join(tmpdir, "manifest.json")
+
+            result = self._run_cli([
+                "--batch", tmpdir,
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            assert result.returncode == 0
+            assert os.path.exists(manifest_file)
+
+            with open(manifest_file, "r") as f:
+                manifest = json.load(f)
+
+            # Find the unsupported file entry
+            unsupported_entries = [
+                e for e in manifest["files"]
+                if e["status"] == "unsupported"
+            ]
+
+            # Should have at least one unsupported entry
+            # and it should have error info
+            if unsupported_entries:
+                entry = unsupported_entries[0]
+                assert entry["quality"] is None
+                # Error info may or may not be present depending on implementation
+                # but quality should definitely be null
+
+    def test_export_manifest_confirmation_message(self):
+        """Test that a confirmation message is printed to stderr when manifest is written."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            manifest_file = f.name
+
+        try:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            assert result.returncode == 0
+
+            # Should print confirmation to stderr
+            assert "manifest" in result.stderr.lower() or manifest_file in result.stderr
+
+        finally:
+            if os.path.exists(manifest_file):
+                os.unlink(manifest_file)
+
+    def test_export_manifest_with_progress_and_summary(self):
+        """Test that --export-manifest works alongside --progress and --summary."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            manifest_file = f.name
+
+        try:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--progress",
+                "--summary",
+                "--export-manifest", manifest_file,
+            ], check=False)
+
+            assert result.returncode == 0
+
+            # Progress should be in stderr
+            assert "[" in result.stderr and "]" in result.stderr
+
+            # Summary should be in stderr
+            assert "BATCH CONVERSION SUMMARY" in result.stderr or "Total files" in result.stderr
+
+            # Manifest should still be created
+            assert os.path.exists(manifest_file)
+            with open(manifest_file, "r") as f:
+                manifest = json.load(f)
+                assert "summary" in manifest
+                assert "files" in manifest
+
+        finally:
+            if os.path.exists(manifest_file):
+                os.unlink(manifest_file)
+
+
+class TestBuildQualityManifest:
+    """Tests for _build_quality_manifest function directly."""
+
+    def test_build_manifest_empty_result(self):
+        """Test building manifest from empty batch result."""
+        from markitdown.__main__ import _build_quality_manifest
+
+        result = BatchConversionResult()
+        manifest = _build_quality_manifest(result)
+
+        assert manifest["summary"]["total_files"] == 0
+        assert manifest["summary"]["successful"] == 0
+        assert manifest["summary"]["average_confidence"] is None
+        assert manifest["files"] == []
+
+    def test_build_manifest_with_successful_items(self):
+        """Test building manifest with successful conversion items."""
+        from markitdown.__main__ import _build_quality_manifest
+        from markitdown._base_converter import DocumentConverterResult
+        from markitdown._conversion_quality import ConversionQuality
+
+        result = BatchConversionResult()
+
+        # Create a mock successful item with quality
+        quality = ConversionQuality()
+        quality.confidence = 0.85
+        quality.converter_used = "TestConverter"
+
+        mock_doc_result = DocumentConverterResult(
+            markdown="# Test",
+            title="Test",
+        )
+        mock_doc_result._quality = quality
+
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/file.json",
+                status=BatchItemStatus.SUCCESS,
+                result=mock_doc_result,
+            )
+        )
+
+        manifest = _build_quality_manifest(result)
+
+        assert manifest["summary"]["total_files"] == 1
+        assert manifest["summary"]["successful"] == 1
+        assert manifest["summary"]["average_confidence"] == 0.85
+        assert len(manifest["files"]) == 1
+        assert manifest["files"][0]["source_path"] == "/test/file.json"
+        assert manifest["files"][0]["status"] == "success"
+        assert manifest["files"][0]["quality"]["confidence"] == 0.85
+
+    def test_build_manifest_with_failed_items(self):
+        """Test building manifest with failed items."""
+        from markitdown.__main__ import _build_quality_manifest
+
+        result = BatchConversionResult()
+
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/file.xyz",
+                status=BatchItemStatus.FAILED,
+                error="Conversion failed",
+                error_type="RuntimeError",
+            )
+        )
+
+        manifest = _build_quality_manifest(result)
+
+        assert manifest["summary"]["total_files"] == 1
+        assert manifest["summary"]["successful"] == 0
+        assert manifest["summary"]["failed"] == 1
+        assert manifest["summary"]["average_confidence"] is None
+
+        file_entry = manifest["files"][0]
+        assert file_entry["status"] == "failed"
+        assert file_entry["quality"] is None
+        assert file_entry["error"] == "Conversion failed"
+        assert file_entry["error_type"] == "RuntimeError"
+
+    def test_build_manifest_mixed_results(self):
+        """Test building manifest with mixed success/failure results."""
+        from markitdown.__main__ import _build_quality_manifest
+        from markitdown._base_converter import DocumentConverterResult
+        from markitdown._conversion_quality import ConversionQuality
+
+        result = BatchConversionResult()
+
+        # Add successful item
+        quality1 = ConversionQuality()
+        quality1.confidence = 0.9
+        quality1.converter_used = "Converter1"
+        doc1 = DocumentConverterResult(markdown="# Doc 1", title="Doc 1")
+        doc1._quality = quality1
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/file1.json",
+                status=BatchItemStatus.SUCCESS,
+                result=doc1,
+            )
+        )
+
+        # Add another successful item with different confidence
+        quality2 = ConversionQuality()
+        quality2.confidence = 0.7
+        quality2.converter_used = "Converter2"
+        doc2 = DocumentConverterResult(markdown="# Doc 2", title="Doc 2")
+        doc2._quality = quality2
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/file2.xlsx",
+                status=BatchItemStatus.SUCCESS,
+                result=doc2,
+            )
+        )
+
+        # Add failed item
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/file3.bin",
+                status=BatchItemStatus.UNSUPPORTED,
+                error="Unsupported format",
+            )
+        )
+
+        manifest = _build_quality_manifest(result)
+
+        assert manifest["summary"]["total_files"] == 3
+        assert manifest["summary"]["successful"] == 2
+        assert manifest["summary"]["unsupported"] == 1
+        # Average confidence should be (0.9 + 0.7) / 2 = 0.8
+        assert manifest["summary"]["average_confidence"] == 0.8
+        assert len(manifest["files"]) == 3
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

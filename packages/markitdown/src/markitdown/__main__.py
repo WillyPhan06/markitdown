@@ -74,6 +74,14 @@ def main():
 
                 # Clear the cache
                 markitdown --clear-cache
+
+            QUALITY MANIFEST EXAMPLES:
+
+                # Export per-file quality metrics to a JSON manifest
+                markitdown --batch /path/to/documents -o /output --export-manifest quality.json
+
+                # Combine with progress and summary for full visibility
+                markitdown --batch /path/to/documents --progress --summary --export-manifest report.json
             """
         ).strip(),
     )
@@ -154,6 +162,19 @@ def main():
         "--quality-json",
         action="store_true",
         help="Output conversion quality information as JSON to stderr.",
+    )
+
+    parser.add_argument(
+        "--export-manifest",
+        type=str,
+        metavar="FILE",
+        help=(
+            "Export quality metrics for each file to a JSON manifest file. "
+            "The manifest includes the source file path, conversion status, "
+            "and detailed quality information (confidence, warnings, formatting losses) "
+            "for each file individually. This makes it easy to review quality metrics "
+            "per file after batch conversions. Only applies in batch mode."
+        ),
     )
 
     # Batch conversion arguments
@@ -347,6 +368,13 @@ def main():
         count = cache.clear()
         print(f"Cleared {count} cached conversion(s) from {cache.cache_dir}")
         sys.exit(0)
+
+    # Validate --export-manifest requires --batch
+    if args.export_manifest and not args.batch:
+        _exit_with_error(
+            "--export-manifest can only be used with --batch mode. "
+            "Use --quality-json for single file quality output."
+        )
 
     if args.use_docintel:
         if args.endpoint is None:
@@ -652,6 +680,96 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
         print("\n" + str(result), file=sys.stderr)
         print("\nOVERALL QUALITY:", file=sys.stderr)
         print(str(result.overall_quality), file=sys.stderr)
+
+    # Step 8: Export manifest file if requested
+    if args.export_manifest:
+        manifest = _build_quality_manifest(result)
+        manifest_path = Path(args.export_manifest)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"Quality manifest written to {manifest_path}", file=sys.stderr)
+
+
+def _build_quality_manifest(result: BatchConversionResult) -> dict:
+    """
+    Build a quality manifest dictionary from batch conversion results.
+
+    The manifest provides a clear mapping between each source file and its
+    quality metrics, making it easy to review conversion quality per file.
+
+    Structure:
+    {
+        "summary": {
+            "total_files": int,
+            "successful": int,
+            "failed": int,
+            "unsupported": int,
+            "average_confidence": float | null  # null if no successful conversions
+        },
+        "files": [
+            {
+                "source_path": str,
+                "status": str,
+                "quality": {
+                    "confidence": float,
+                    "converter_used": str,
+                    "warnings": [...],
+                    "formatting_loss": [...],
+                    ...
+                } | null,
+                "error": str | null
+            },
+            ...
+        ]
+    }
+    """
+    # Build summary
+    # Use None for average_confidence when no files were successfully converted
+    # to clearly indicate no quality data is available (vs 0.0 which could mean low quality)
+    avg_confidence = None
+    successful_items = result.successful_items
+    if successful_items:
+        items_with_quality = [item for item in successful_items if item.quality]
+        if items_with_quality:
+            total_confidence = sum(item.quality.confidence for item in items_with_quality)
+            avg_confidence = total_confidence / len(items_with_quality)
+
+    manifest = {
+        "summary": {
+            "total_files": result.total_count,
+            "successful": result.success_count,
+            "cached": result.cached_count,
+            "failed": result.failed_count,
+            "unsupported": result.unsupported_count,
+            "skipped": result.skipped_count,
+            "completion_percentage": result.completion_percentage,
+            "average_confidence": avg_confidence,
+        },
+        "files": [],
+    }
+
+    # Build per-file entries
+    for item in result.items:
+        file_entry = {
+            "source_path": item.source_path,
+            "status": item.status.value,
+        }
+
+        # Add quality info if available
+        if item.quality:
+            file_entry["quality"] = item.quality.to_dict()
+        else:
+            file_entry["quality"] = None
+
+        # Add error info if present
+        if item.error:
+            file_entry["error"] = item.error
+            file_entry["error_type"] = item.error_type
+
+        manifest["files"].append(file_entry)
+
+    return manifest
 
 
 def _handle_output(args, result: DocumentConverterResult):
