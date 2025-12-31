@@ -762,6 +762,12 @@ def _build_quality_manifest(result: BatchConversionResult) -> dict:
         else:
             file_entry["quality"] = None
 
+        # Add metadata if available and not empty
+        if item.metadata and not item.metadata.is_empty():
+            file_entry["metadata"] = item.metadata.to_dict()
+        else:
+            file_entry["metadata"] = None
+
         # Add error info if present
         if item.error:
             file_entry["error"] = item.error

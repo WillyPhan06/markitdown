@@ -96,6 +96,7 @@ class CacheEntry:
     markdown: str
     title: Optional[str]
     quality_dict: Optional[Dict[str, Any]]
+    metadata_dict: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a dictionary for serialization."""
@@ -104,6 +105,7 @@ class CacheEntry:
             "markdown": self.markdown,
             "title": self.title,
             "quality_dict": self.quality_dict,
+            "metadata_dict": self.metadata_dict,
         }
 
     @classmethod
@@ -114,6 +116,7 @@ class CacheEntry:
             markdown=data["markdown"],
             title=data.get("title"),
             quality_dict=data.get("quality_dict"),
+            metadata_dict=data.get("metadata_dict"),
         )
 
 
@@ -249,11 +252,16 @@ class ConversionCache:
             if result._quality is not None:
                 quality_dict = result.quality.to_dict()
 
+            metadata_dict = None
+            if result._metadata is not None and not result._metadata.is_empty():
+                metadata_dict = result.metadata.to_dict()
+
             entry = CacheEntry(
                 file_hash=file_hash,
                 markdown=result.markdown,
                 title=result.title,
                 quality_dict=quality_dict,
+                metadata_dict=metadata_dict,
             )
 
             # Ensure subdirectory exists (using first 2 chars of hash)
@@ -364,6 +372,7 @@ def cache_entry_to_result(entry: CacheEntry) -> "DocumentConverterResult":
     """
     from ._base_converter import DocumentConverterResult
     from ._conversion_quality import ConversionQuality
+    from ._document_metadata import DocumentMetadata
 
     # Reconstruct quality if present
     quality = None
@@ -372,8 +381,14 @@ def cache_entry_to_result(entry: CacheEntry) -> "DocumentConverterResult":
         # Mark that this result came from cache
         quality.set_metric("from_cache", True)
 
+    # Reconstruct metadata if present
+    metadata = None
+    if entry.metadata_dict is not None:
+        metadata = DocumentMetadata.from_dict(entry.metadata_dict)
+
     return DocumentConverterResult(
         markdown=entry.markdown,
         title=entry.title,
         quality=quality,
+        metadata=metadata,
     )

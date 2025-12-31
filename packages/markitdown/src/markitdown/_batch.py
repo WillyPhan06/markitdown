@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
 from ._base_converter import DocumentConverterResult
 from ._conversion_quality import ConversionQuality, WarningSeverity
+from ._document_metadata import DocumentMetadata
 from ._stream_info import StreamInfo
 
 
@@ -69,6 +70,13 @@ class BatchItemResult:
             return self.result.quality
         return None
 
+    @property
+    def metadata(self) -> Optional[DocumentMetadata]:
+        """Get the document metadata if conversion was successful."""
+        if self.result is not None:
+            return self.result.metadata
+        return None
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to a dictionary for serialization."""
         result_dict: Dict[str, Any] = {
@@ -78,6 +86,9 @@ class BatchItemResult:
         if self.result is not None:
             result_dict["title"] = self.result.title
             result_dict["quality"] = self.result.quality.to_dict()
+            # Only include metadata if it's not empty
+            if self.result._metadata is not None and not self.result._metadata.is_empty():
+                result_dict["metadata"] = self.result.metadata.to_dict()
         if self.error is not None:
             result_dict["error"] = self.error
             result_dict["error_type"] = self.error_type

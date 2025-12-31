@@ -46,6 +46,7 @@ from .converters import (
 
 from ._base_converter import DocumentConverter, DocumentConverterResult
 from ._conversion_quality import ConversionQuality
+from ._metadata_extractor import extract_metadata
 
 from ._exceptions import (
     FileConversionException,
@@ -753,6 +754,42 @@ class MarkItDown:
                     if res._quality is None:
                         res._quality = ConversionQuality()
                     res._quality.converter_used = type(converter).__name__
+
+                    # Extract document metadata if not already set by converter
+                    if res._metadata is None or res._metadata.is_empty():
+                        try:
+                            res._metadata = extract_metadata(
+                                file_stream,
+                                stream_info,
+                                res.markdown,
+                                **_kwargs,
+                            )
+                        except Exception as e:
+                            # Metadata extraction should never fail the conversion.
+                            # Log a detailed warning so developers can debug if needed.
+                            #
+                            # The warning includes:
+                            # - Source identifier (filename, local_path, or 'stream')
+                            # - File type info (extension, mimetype) for context
+                            # - Exception type and message
+                            # - Traceback for debugging (abbreviated to last 3 frames)
+                            source_id = (
+                                stream_info.filename
+                                or stream_info.local_path
+                                or "stream"
+                            )
+                            file_type = stream_info.extension or stream_info.mimetype or "unknown"
+                            tb_lines = traceback.format_exc().strip().split("\n")
+                            # Get last few lines of traceback for context
+                            tb_summary = "\n".join(tb_lines[-6:]) if len(tb_lines) > 6 else "\n".join(tb_lines)
+
+                            warn(
+                                f"Metadata extraction failed for '{source_id}' "
+                                f"(type: {file_type}): {type(e).__name__}: {e}\n"
+                                f"Traceback (most recent call last):\n{tb_summary}",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
 
                     return res
 

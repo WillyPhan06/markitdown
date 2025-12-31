@@ -2,6 +2,7 @@ from typing import Any, BinaryIO, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ._conversion_quality import ConversionQuality
+    from ._document_metadata import DocumentMetadata
 
 from ._stream_info import StreamInfo
 
@@ -15,6 +16,7 @@ class DocumentConverterResult:
         *,
         title: Optional[str] = None,
         quality: Optional["ConversionQuality"] = None,
+        metadata: Optional["DocumentMetadata"] = None,
     ):
         """
         Initialize the DocumentConverterResult.
@@ -26,10 +28,12 @@ class DocumentConverterResult:
         - markdown: The converted Markdown text.
         - title: Optional title of the document.
         - quality: Optional ConversionQuality object with metadata about the conversion quality.
+        - metadata: Optional DocumentMetadata object with document metadata (author, date, etc.).
         """
         self.markdown = markdown
         self.title = title
         self._quality = quality
+        self._metadata = metadata
 
     @property
     def quality(self) -> "ConversionQuality":
@@ -50,6 +54,26 @@ class DocumentConverterResult:
     def quality(self, value: "ConversionQuality") -> None:
         """Set the quality information for this conversion."""
         self._quality = value
+
+    @property
+    def metadata(self) -> "DocumentMetadata":
+        """
+        Get the document metadata for this conversion.
+
+        Returns a DocumentMetadata object. If no metadata was provided
+        during conversion, returns an empty metadata object.
+        """
+        if self._metadata is None:
+            # Lazy import to avoid circular dependencies
+            from ._document_metadata import DocumentMetadata
+
+            self._metadata = DocumentMetadata()
+        return self._metadata
+
+    @metadata.setter
+    def metadata(self, value: "DocumentMetadata") -> None:
+        """Set the document metadata for this conversion."""
+        self._metadata = value
 
     @property
     def text_content(self) -> str:

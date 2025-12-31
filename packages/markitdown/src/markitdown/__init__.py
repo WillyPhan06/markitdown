@@ -32,6 +32,7 @@ from ._batch import (
     write_batch_results,
 )
 from ._cache import ConversionCache
+from ._document_metadata import DocumentMetadata
 
 __all__ = [
     "__version__",
@@ -59,4 +60,6 @@ __all__ = [
     "write_batch_results",
     # Caching
     "ConversionCache",
+    # Document metadata
+    "DocumentMetadata",
 ]
