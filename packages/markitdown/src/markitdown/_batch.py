@@ -44,6 +44,7 @@ class BatchItemStatus(Enum):
     SKIPPED = "skipped"
     UNSUPPORTED = "unsupported"
     CACHED = "cached"  # Retrieved from cache without re-conversion
+    RESUMED = "resumed"  # Skipped because output file already exists (--resume mode)
 
 
 @dataclass
@@ -121,6 +122,11 @@ class BatchConversionResult:
         return sum(1 for item in self.items if item.status == BatchItemStatus.CACHED)
 
     @property
+    def resumed_count(self) -> int:
+        """Number of files skipped because output already exists (--resume mode)."""
+        return sum(1 for item in self.items if item.status == BatchItemStatus.RESUMED)
+
+    @property
     def failed_count(self) -> int:
         """Number of failed conversions."""
         return sum(1 for item in self.items if item.status == BatchItemStatus.FAILED)
@@ -149,6 +155,11 @@ class BatchConversionResult:
     def cached_items(self) -> List[BatchItemResult]:
         """Get all items retrieved from cache."""
         return [item for item in self.items if item.status == BatchItemStatus.CACHED]
+
+    @property
+    def resumed_items(self) -> List[BatchItemResult]:
+        """Get all items skipped because output already exists (--resume mode)."""
+        return [item for item in self.items if item.status == BatchItemStatus.RESUMED]
 
     @property
     def failed_items(self) -> List[BatchItemResult]:
@@ -253,6 +264,7 @@ class BatchConversionResult:
             "total_count": self.total_count,
             "success_count": self.success_count,
             "cached_count": self.cached_count,
+            "resumed_count": self.resumed_count,
             "failed_count": self.failed_count,
             "skipped_count": self.skipped_count,
             "unsupported_count": self.unsupported_count,
@@ -275,6 +287,8 @@ class BatchConversionResult:
         lines.append(f"  Successful: {self.success_count}")
         if self.cached_count > 0:
             lines.append(f"    (from cache: {self.cached_count})")
+        if self.resumed_count > 0:
+            lines.append(f"  Resumed (already converted): {self.resumed_count}")
         lines.append(f"  Failed: {self.failed_count}")
         lines.append(f"  Skipped: {self.skipped_count}")
         lines.append(f"  Unsupported: {self.unsupported_count}")
@@ -313,6 +327,14 @@ class BatchConversionResult:
             if len(self.cached_items) > 10:
                 lines.append(f"  ... and {len(self.cached_items) - 10} more")
 
+        # Show resumed files (skipped because output already exists)
+        if self.resumed_items:
+            lines.append("\nFiles skipped (output already exists):")
+            for item in self.resumed_items[:10]:  # Show first 10
+                lines.append(f"  ⏭ {item.source_path}")
+            if len(self.resumed_items) > 10:
+                lines.append(f"  ... and {len(self.resumed_items) - 10} more")
+
         # Show failed files
         if self.failed_items:
             lines.append("\nFailed files:")
@@ -323,6 +345,89 @@ class BatchConversionResult:
 
         lines.append("=" * 60)
         return "\n".join(lines)
+
+
+def get_expected_output_path(
+    source_path: Union[str, Path],
+    output_directory: Union[str, Path],
+    source_directory: Optional[Union[str, Path]] = None,
+    preserve_structure: bool = True,
+    file_extension: str = ".md",
+) -> Path:
+    """
+    Compute the expected output path for a source file.
+
+    This mirrors the logic in write_batch_results() to determine where a converted
+    file would be written, allowing us to check if it already exists.
+
+    Args:
+        source_path: Path to the source file.
+        output_directory: Directory where output files are written.
+        source_directory: Base directory for preserving relative structure.
+        preserve_structure: If True, preserve the source directory structure.
+        file_extension: Extension for output files (default: ".md").
+
+    Returns:
+        The expected output path for this source file.
+    """
+    source_path = Path(source_path)
+    output_directory = Path(output_directory)
+    source_dir = Path(source_directory) if source_directory else None
+
+    if preserve_structure and source_dir:
+        try:
+            # Preserve relative directory structure
+            relative_path = source_path.relative_to(source_dir)
+            return output_directory / relative_path.with_suffix(file_extension)
+        except ValueError:
+            # Source not relative to source_dir
+            return output_directory / (source_path.stem + file_extension)
+    else:
+        return output_directory / (source_path.stem + file_extension)
+
+
+def find_existing_outputs(
+    sources: List[Union[str, Path]],
+    output_directory: Union[str, Path],
+    source_directory: Optional[Union[str, Path]] = None,
+    preserve_structure: bool = True,
+    file_extension: str = ".md",
+) -> Dict[str, Path]:
+    """
+    Find source files that already have corresponding output files.
+
+    This is used by the --resume feature to skip files that have already been
+    converted in a previous (interrupted) batch conversion.
+
+    Args:
+        sources: List of source file paths to check.
+        output_directory: Directory where output files are/would be written.
+        source_directory: Base directory for preserving relative structure.
+        preserve_structure: If True, preserve the source directory structure.
+        file_extension: Extension for output files (default: ".md").
+
+    Returns:
+        Dictionary mapping source paths (as strings) to their existing output paths.
+    """
+    existing: Dict[str, Path] = {}
+    output_directory = Path(output_directory)
+
+    if not output_directory.exists():
+        return existing
+
+    for source in sources:
+        source_str = str(source)
+        expected_output = get_expected_output_path(
+            source,
+            output_directory,
+            source_directory=source_directory,
+            preserve_structure=preserve_structure,
+            file_extension=file_extension,
+        )
+        if expected_output.exists():
+            existing[source_str] = expected_output
+
+    return existing
 
 
 def convert_batch(

@@ -9,6 +9,7 @@ import codecs
 import threading
 from pathlib import Path
 from textwrap import dedent
+from typing import List
 from importlib.metadata import entry_points
 from .__about__ import __version__
 from ._markitdown import MarkItDown, StreamInfo, DocumentConverterResult
@@ -74,6 +75,17 @@ def main():
 
                 # Clear the cache
                 markitdown --clear-cache
+
+            RESUME/RESTART EXAMPLES:
+
+                # Resume an interrupted batch conversion (skip files already converted)
+                markitdown --batch /path/to/documents -o /output --resume --progress
+
+                # Restart batch conversion from scratch (re-convert all files)
+                markitdown --batch /path/to/documents -o /output --restart
+
+                # Resume is faster than --cache because it only checks if output files exist
+                # instead of reading and hashing file contents
 
             QUALITY MANIFEST EXAMPLES:
 
@@ -297,6 +309,32 @@ def main():
         ),
     )
 
+    # Resume/restart arguments for interrupted batch conversions
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume an interrupted batch conversion. Only converts files that don't "
+            "already have corresponding output files in the output directory. "
+            "Files are matched by name: if 'report.pdf' would produce 'report.md' and "
+            "'report.md' already exists in the output directory, it is skipped. "
+            "Requires --output to specify the output directory. "
+            "This is faster than --cache for resuming because it doesn't need to read "
+            "and hash file contents - it simply checks if output files exist."
+        ),
+    )
+
+    parser.add_argument(
+        "--restart",
+        action="store_true",
+        help=(
+            "Restart a batch conversion from scratch, ignoring any existing output files. "
+            "This is the default behavior, but can be explicitly specified when you want "
+            "to re-convert all files even if output files already exist. "
+            "Mutually exclusive with --resume."
+        ),
+    )
+
     parser.add_argument("filename", nargs="*")
     args = parser.parse_args()
 
@@ -374,6 +412,31 @@ def main():
         _exit_with_error(
             "--export-manifest can only be used with --batch mode. "
             "Use --quality-json for single file quality output."
+        )
+
+    # Validate --resume and --restart flags
+    if args.resume and args.restart:
+        _exit_with_error(
+            "--resume and --restart are mutually exclusive. "
+            "Use --resume to skip already converted files, or --restart to re-convert all files."
+        )
+
+    if args.resume and not args.batch:
+        _exit_with_error("--resume can only be used with --batch mode.")
+
+    if args.restart and not args.batch:
+        _exit_with_error("--restart can only be used with --batch mode.")
+
+    if args.resume and not args.output:
+        _exit_with_error(
+            "--resume requires --output to specify the output directory. "
+            "The output directory is used to check which files have already been converted."
+        )
+
+    if args.resume and args.output and Path(args.output).suffix == ".json":
+        _exit_with_error(
+            "--resume cannot be used with JSON output (--output *.json). "
+            "Use --output with a directory path instead."
         )
 
     if args.use_docintel:
@@ -494,7 +557,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
         markitdown: Configured MarkItDown instance to use for conversions
         stream_info: Optional StreamInfo with hints about file types (rarely used in batch mode)
     """
-    from ._batch import write_batch_results
+    from ._batch import write_batch_results, find_existing_outputs, BatchItemResult
 
     # Step 1: Input validation
     if not args.filename:
@@ -530,6 +593,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                 status_icon = {
                     BatchItemStatus.SUCCESS: "✓",
                     BatchItemStatus.CACHED: "⚡",  # Lightning bolt for cached (fast)
+                    BatchItemStatus.RESUMED: "⏭",  # Skip icon for resumed (already exists)
                     BatchItemStatus.FAILED: "✗",
                     BatchItemStatus.SKIPPED: "○",
                     BatchItemStatus.UNSUPPORTED: "?",
@@ -548,6 +612,8 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                     confidence_str = f" ({item.quality.confidence:.0%})"
                 if item.status == BatchItemStatus.CACHED:
                     confidence_str += " [cached]"
+                if item.status == BatchItemStatus.RESUMED:
+                    confidence_str = " [already exists]"
 
                 # Print to stderr (not stdout) so it doesn't mix with converted content
                 # flush=True ensures immediate output even when stderr is piped/redirected
@@ -560,28 +626,40 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
     # Step 3: Determine input mode - single directory vs mixed files/directories
     sources = args.filename
     is_single_directory = len(sources) == 1 and Path(sources[0]).is_dir()
+    source_directory = sources[0] if is_single_directory else None
 
+    # Step 4: Collect all files to process
+    files_to_convert = []
     if is_single_directory:
-        # Single directory mode: use optimized convert_directory() method
-        # This handles recursive scanning and pattern matching internally
-        directory = sources[0]
-        result = markitdown.convert_directory(
-            directory,
-            recursive=not args.no_recursive,
-            include_patterns=args.include,
-            exclude_patterns=args.exclude,
-            stream_info=stream_info,
-            max_workers=args.parallel,
-            on_progress=progress_callback,
-            keep_data_uris=args.keep_data_uris if hasattr(args, "keep_data_uris") else False,
-            cache=cache,
-        )
+        # Single directory mode: scan directory for files
+        import fnmatch
+
+        directory = Path(sources[0])
+        pattern = "**/*" if not args.no_recursive else "*"
+        for file_path in directory.glob(pattern):
+            if not file_path.is_file():
+                continue
+
+            # Apply include patterns
+            if args.include:
+                matched = any(
+                    fnmatch.fnmatch(file_path.name, pat) for pat in args.include
+                )
+                if not matched:
+                    continue
+
+            # Apply exclude patterns
+            if args.exclude:
+                excluded = any(
+                    fnmatch.fnmatch(file_path.name, pat) for pat in args.exclude
+                )
+                if excluded:
+                    continue
+
+            files_to_convert.append(str(file_path))
     else:
         # Mixed mode: user provided multiple files and/or directories
         # We need to manually expand directories and apply filtering
-
-        # Step 4a: Expand any directories in the input list
-        files_to_convert = []
         for source in sources:
             source_path = Path(source)
             if source_path.is_dir():
@@ -595,7 +673,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                 # Individual file - add directly
                 files_to_convert.append(source)
 
-        # Step 4b: Apply include/exclude pattern filtering
+        # Apply include/exclude pattern filtering
         if args.include or args.exclude:
             import fnmatch
 
@@ -625,7 +703,45 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
 
             files_to_convert = filtered_files
 
-        # Step 5: Execute batch conversion
+    # Step 5: Handle --resume mode - find files that already have output
+    resumed_items: List[BatchItemResult] = []
+    if getattr(args, "resume", False) and args.output:
+        output_path = Path(args.output)
+        existing_outputs = find_existing_outputs(
+            files_to_convert,
+            output_path,
+            source_directory=source_directory,
+            preserve_structure=is_single_directory,
+        )
+
+        if existing_outputs:
+            # Separate files that need conversion from files that are already done
+            files_needing_conversion = []
+            for file_path in files_to_convert:
+                if file_path in existing_outputs:
+                    # Create a RESUMED item for this file
+                    resumed_items.append(
+                        BatchItemResult(
+                            source_path=file_path,
+                            status=BatchItemStatus.RESUMED,
+                        )
+                    )
+                    if progress_callback:
+                        progress_callback(resumed_items[-1])
+                else:
+                    files_needing_conversion.append(file_path)
+
+            files_to_convert = files_needing_conversion
+
+            if args.progress:
+                print(
+                    f"Resume mode: {len(existing_outputs)} files already converted, "
+                    f"{len(files_to_convert)} files remaining",
+                    file=sys.stderr,
+                )
+
+    # Step 6: Execute batch conversion on remaining files
+    if files_to_convert:
         result = markitdown.convert_batch(
             files_to_convert,
             stream_info=stream_info,
@@ -634,8 +750,20 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
             keep_data_uris=args.keep_data_uris if hasattr(args, "keep_data_uris") else False,
             cache=cache,
         )
+        # Add resumed items to the result
+        result.items.extend(resumed_items)
+    else:
+        # All files were already converted (resume mode)
+        from ._batch import BatchConversionResult
+        result = BatchConversionResult(items=resumed_items)
+        if args.progress:
+            print("All files have already been converted.", file=sys.stderr)
 
-    # Step 6: Handle output based on --output flag
+    # Set source directory for proper path preservation in output
+    if is_single_directory:
+        result.source_directory = source_directory
+
+    # Step 7: Handle output based on --output flag
     if args.output:
         output_path = Path(args.output)
         if output_path.suffix == ".json":
@@ -670,7 +798,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                     )
                 )
 
-    # Step 7: Output quality/summary information if requested
+    # Step 8: Output quality/summary information if requested
     if args.quality_json:
         # Machine-readable JSON output to stderr
         quality_dict = result.to_dict()
@@ -681,7 +809,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
         print("\nOVERALL QUALITY:", file=sys.stderr)
         print(str(result.overall_quality), file=sys.stderr)
 
-    # Step 8: Export manifest file if requested
+    # Step 9: Export manifest file if requested
     if args.export_manifest:
         manifest = _build_quality_manifest(result)
         manifest_path = Path(args.export_manifest)
@@ -740,6 +868,7 @@ def _build_quality_manifest(result: BatchConversionResult) -> dict:
             "total_files": result.total_count,
             "successful": result.success_count,
             "cached": result.cached_count,
+            "resumed": result.resumed_count,
             "failed": result.failed_count,
             "unsupported": result.unsupported_count,
             "skipped": result.skipped_count,
