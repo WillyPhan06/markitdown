@@ -551,6 +551,7 @@ class MarkItDown:
         on_progress: Optional[Callable[[BatchItemResult], None]] = None,
         skip_errors: bool = True,
         cache: Optional["ConversionCache"] = None,
+        min_confidence: Optional[float] = None,
         **kwargs: Any,
     ) -> BatchConversionResult:
         """
@@ -570,6 +571,12 @@ class MarkItDown:
                         If False, raise an exception on first error.
             cache: Optional ConversionCache instance for caching results. When provided,
                    unchanged files will be retrieved from cache instead of re-converting.
+            min_confidence: Optional minimum quality confidence threshold (0.0-1.0). Files
+                           that convert successfully but have confidence below this threshold
+                           will be marked as FILTERED_LOW_QUALITY and excluded from successful_items.
+                           Note: Files without a quality confidence score (quality=None) will pass
+                           through as SUCCESS since there's no score to compare. Use
+                           successful_without_quality_items to identify these for manual review.
             **kwargs: Additional arguments passed to each conversion.
 
         Returns:
@@ -597,6 +604,7 @@ class MarkItDown:
             on_progress=on_progress,
             skip_errors=skip_errors,
             cache=cache,
+            min_confidence=min_confidence,
             **kwargs,
         )
 

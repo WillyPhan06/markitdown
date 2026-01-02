@@ -45,6 +45,7 @@ class BatchItemStatus(Enum):
     UNSUPPORTED = "unsupported"
     CACHED = "cached"  # Retrieved from cache without re-conversion
     RESUMED = "resumed"  # Skipped because output file already exists (--resume mode)
+    FILTERED_LOW_QUALITY = "filtered_low_quality"  # Filtered out due to quality confidence below threshold
 
 
 @dataclass
@@ -144,6 +145,13 @@ class BatchConversionResult:
         )
 
     @property
+    def filtered_low_quality_count(self) -> int:
+        """Number of files filtered out due to low quality confidence."""
+        return sum(
+            1 for item in self.items if item.status == BatchItemStatus.FILTERED_LOW_QUALITY
+        )
+
+    @property
     def successful_items(self) -> List[BatchItemResult]:
         """Get all successfully converted items (including cached)."""
         return [
@@ -165,6 +173,31 @@ class BatchConversionResult:
     def failed_items(self) -> List[BatchItemResult]:
         """Get all failed items."""
         return [item for item in self.items if item.status == BatchItemStatus.FAILED]
+
+    @property
+    def filtered_low_quality_items(self) -> List[BatchItemResult]:
+        """Get all items filtered out due to low quality confidence."""
+        return [item for item in self.items if item.status == BatchItemStatus.FILTERED_LOW_QUALITY]
+
+    @property
+    def successful_without_quality_items(self) -> List[BatchItemResult]:
+        """
+        Get successful items that have no quality confidence score.
+
+        These files passed through without being evaluated for quality.
+        When using --min-confidence filtering, these files are NOT filtered
+        because there's no confidence score to compare against the threshold.
+        Users should manually review these files if quality assurance is critical.
+        """
+        return [
+            item for item in self.successful_items
+            if item.quality is None or item.result is None
+        ]
+
+    @property
+    def successful_without_quality_count(self) -> int:
+        """Number of successful files without quality confidence score."""
+        return len(self.successful_without_quality_items)
 
     @property
     def completion_percentage(self) -> float:
@@ -268,6 +301,8 @@ class BatchConversionResult:
             "failed_count": self.failed_count,
             "skipped_count": self.skipped_count,
             "unsupported_count": self.unsupported_count,
+            "filtered_low_quality_count": self.filtered_low_quality_count,
+            "successful_without_quality_count": self.successful_without_quality_count,
             "completion_percentage": self.completion_percentage,
             "overall_quality": self.overall_quality.to_dict(),
             "items": [item.to_dict() for item in self.items],
@@ -292,6 +327,8 @@ class BatchConversionResult:
         lines.append(f"  Failed: {self.failed_count}")
         lines.append(f"  Skipped: {self.skipped_count}")
         lines.append(f"  Unsupported: {self.unsupported_count}")
+        if self.filtered_low_quality_count > 0:
+            lines.append(f"  Filtered (low quality): {self.filtered_low_quality_count}")
         lines.append(f"Completion: {self.completion_percentage:.1f}%")
 
         if self.successful_items:
@@ -342,6 +379,28 @@ class BatchConversionResult:
                 lines.append(f"  ✗ {item.source_path}: {item.error}")
             if len(self.failed_items) > 10:
                 lines.append(f"  ... and {len(self.failed_items) - 10} more")
+
+        # Show filtered low quality files (excluded due to confidence below threshold)
+        if self.filtered_low_quality_items:
+            lines.append("\nFiltered out (low quality):")
+            for item in self.filtered_low_quality_items[:10]:  # Show first 10
+                confidence_str = ""
+                if item.quality:
+                    confidence_str = f" ({item.quality.confidence:.0%})"
+                lines.append(f"  ⚠ {item.source_path}{confidence_str}")
+            if len(self.filtered_low_quality_items) > 10:
+                lines.append(f"  ... and {len(self.filtered_low_quality_items) - 10} more")
+
+        # Show warning for successful files without quality score
+        # These files passed through without quality evaluation
+        if self.successful_without_quality_items:
+            lines.append("\n⚠ WARNING: Files without quality score (not evaluated):")
+            lines.append("  These files were NOT checked against --min-confidence threshold.")
+            lines.append("  Please review manually if quality assurance is required.")
+            for item in self.successful_without_quality_items[:10]:  # Show first 10
+                lines.append(f"  ? {item.source_path} (no quality data)")
+            if len(self.successful_without_quality_items) > 10:
+                lines.append(f"  ... and {len(self.successful_without_quality_items) - 10} more")
 
         lines.append("=" * 60)
         return "\n".join(lines)
@@ -439,6 +498,7 @@ def convert_batch(
     on_progress: Optional[Callable[[BatchItemResult], None]] = None,
     skip_errors: bool = True,
     cache: Optional["ConversionCache"] = None,
+    min_confidence: Optional[float] = None,
     **kwargs: Any,
 ) -> BatchConversionResult:
     """
@@ -453,6 +513,12 @@ def convert_batch(
         skip_errors: If True, continue processing on errors. If False, raise on first error.
         cache: Optional ConversionCache instance for caching results. When provided,
                unchanged files will be retrieved from cache instead of re-converting.
+        min_confidence: Optional minimum quality confidence threshold (0.0-1.0). Files
+               that convert successfully but have confidence below this threshold will
+               be marked as FILTERED_LOW_QUALITY and excluded from successful_items.
+               Note: Files without a quality confidence score (quality=None) will pass
+               through and be marked as SUCCESS, as there's no score to compare against.
+               Use successful_without_quality_items to identify these files for manual review.
         **kwargs: Additional arguments passed to each conversion.
 
     Returns:
@@ -472,6 +538,15 @@ def convert_batch(
                     from ._cache import cache_entry_to_result
 
                     conversion_result = cache_entry_to_result(cache_entry)
+                    # Check min_confidence threshold for cached results
+                    if min_confidence is not None:
+                        quality = conversion_result.quality
+                        if quality and quality.confidence < min_confidence:
+                            return BatchItemResult(
+                                source_path=source_str,
+                                status=BatchItemStatus.FILTERED_LOW_QUALITY,
+                                result=conversion_result,
+                            )
                     return BatchItemResult(
                         source_path=source_str,
                         status=BatchItemStatus.CACHED,
@@ -493,6 +568,16 @@ def convert_batch(
                 except Exception:
                     # Cache write failed, ignore
                     pass
+
+            # Check min_confidence threshold
+            if min_confidence is not None:
+                quality = conversion_result.quality
+                if quality and quality.confidence < min_confidence:
+                    return BatchItemResult(
+                        source_path=source_str,
+                        status=BatchItemStatus.FILTERED_LOW_QUALITY,
+                        result=conversion_result,
+                    )
 
             return BatchItemResult(
                 source_path=source_str,

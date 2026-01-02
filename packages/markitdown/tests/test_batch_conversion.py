@@ -1742,5 +1742,84 @@ class TestResumedStatus:
         assert d["resumed_count"] == 1
 
 
+class TestQualityFiltering:
+    """Tests for quality confidence filtering feature."""
+
+    def test_filtered_low_quality_status_exists(self):
+        """Test that FILTERED_LOW_QUALITY status exists."""
+        assert hasattr(BatchItemStatus, "FILTERED_LOW_QUALITY")
+        assert BatchItemStatus.FILTERED_LOW_QUALITY.value == "filtered_low_quality"
+
+    def test_batch_result_tracks_filtered_low_quality_count(self):
+        """Test that batch result tracks filtered low quality items."""
+        result = BatchConversionResult()
+
+        result.items.append(
+            BatchItemResult(source_path="/test/file1.pdf", status=BatchItemStatus.SUCCESS)
+        )
+        result.items.append(
+            BatchItemResult(source_path="/test/file2.pdf", status=BatchItemStatus.FILTERED_LOW_QUALITY)
+        )
+
+        assert result.filtered_low_quality_count == 1
+        assert len(result.filtered_low_quality_items) == 1
+        assert result.filtered_low_quality_items[0].source_path == "/test/file2.pdf"
+
+    def test_filtered_low_quality_items_not_in_successful_items(self):
+        """Test that filtered low quality items are not included in successful_items."""
+        result = BatchConversionResult()
+
+        result.items.append(
+            BatchItemResult(source_path="/test/file1.pdf", status=BatchItemStatus.SUCCESS)
+        )
+        result.items.append(
+            BatchItemResult(source_path="/test/file2.pdf", status=BatchItemStatus.FILTERED_LOW_QUALITY)
+        )
+
+        assert len(result.successful_items) == 1
+        assert result.successful_items[0].source_path == "/test/file1.pdf"
+
+    def test_batch_result_to_dict_includes_filtered_low_quality(self):
+        """Test that to_dict includes filtered_low_quality_count."""
+        result = BatchConversionResult()
+
+        result.items.append(
+            BatchItemResult(source_path="/test/file1.pdf", status=BatchItemStatus.FILTERED_LOW_QUALITY)
+        )
+
+        d = result.to_dict()
+        assert "filtered_low_quality_count" in d
+        assert d["filtered_low_quality_count"] == 1
+
+    def test_batch_result_str_shows_filtered_low_quality(self):
+        """Test that string representation shows filtered low quality items."""
+        from markitdown._conversion_quality import ConversionQuality
+        from markitdown._base_converter import DocumentConverterResult
+
+        result = BatchConversionResult()
+
+        # Create a real DocumentConverterResult with low quality
+        quality = ConversionQuality()
+        quality.confidence = 0.4
+        doc_result = DocumentConverterResult(
+            markdown="test content",
+            title="Test Document",
+        )
+        doc_result._quality = quality
+
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/filtered_file.pdf",
+                status=BatchItemStatus.FILTERED_LOW_QUALITY,
+                result=doc_result,
+            )
+        )
+
+        summary = str(result)
+        assert "Filtered (low quality): 1" in summary
+        assert "Filtered out (low quality):" in summary
+        assert "/test/filtered_file.pdf" in summary
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

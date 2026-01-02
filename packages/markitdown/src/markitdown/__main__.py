@@ -94,6 +94,17 @@ def main():
 
                 # Combine with progress and summary for full visibility
                 markitdown --batch /path/to/documents --progress --summary --export-manifest report.json
+
+            QUALITY FILTERING EXAMPLES:
+
+                # Only keep files with 70% or higher confidence (filter out low quality)
+                markitdown --batch /path/to/documents -o /output --min-confidence 0.7
+
+                # Strict filtering: only keep high quality conversions (90%+ confidence)
+                markitdown --batch /path/to/documents -o /output --min-confidence 0.9 --progress
+
+                # Combine filtering with manifest to see what was filtered
+                markitdown --batch /path/to/documents -o /output --min-confidence 0.7 --export-manifest quality.json
             """
         ).strip(),
     )
@@ -277,6 +288,21 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--min-confidence",
+        type=float,
+        metavar="THRESHOLD",
+        help=(
+            "Minimum quality confidence threshold (0.0-1.0) for batch conversions. "
+            "Files that convert successfully but have a quality confidence below this "
+            "threshold will be filtered out and not written to output. This helps "
+            "automatically skip low-quality conversions that may require manual review. "
+            "For example, '--min-confidence 0.7' will only keep files with 70%% or higher "
+            "confidence. Filtered files are reported separately in the summary and manifest. "
+            "Only applies in batch mode with directory output (not JSON output)."
+        ),
+    )
+
     # Cache arguments
     parser.add_argument(
         "--cache",
@@ -439,6 +465,20 @@ def main():
             "Use --output with a directory path instead."
         )
 
+    # Validate --min-confidence
+    if args.min_confidence is not None:
+        if not args.batch:
+            _exit_with_error("--min-confidence can only be used with --batch mode.")
+        if args.min_confidence < 0.0 or args.min_confidence > 1.0:
+            _exit_with_error(
+                f"--min-confidence must be between 0.0 and 1.0, got {args.min_confidence}.\n"
+                "The value represents a percentage as a decimal:\n"
+                "  - 0.5 means 50% minimum confidence\n"
+                "  - 0.7 means 70% minimum confidence\n"
+                "  - 0.9 means 90% minimum confidence\n"
+                "Example: --min-confidence 0.7 to filter out files with less than 70% confidence."
+            )
+
     if args.use_docintel:
         if args.endpoint is None:
             _exit_with_error(
@@ -597,6 +637,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                     BatchItemStatus.FAILED: "✗",
                     BatchItemStatus.SKIPPED: "○",
                     BatchItemStatus.UNSUPPORTED: "?",
+                    BatchItemStatus.FILTERED_LOW_QUALITY: "⚠",  # Warning icon for filtered low quality
                 }.get(item.status, "?")
 
                 # Truncate long paths to keep output readable
@@ -608,12 +649,14 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                 # Show confidence percentage for successful conversions
                 # This gives users immediate feedback on conversion quality
                 confidence_str = ""
-                if item.quality and item.status in (BatchItemStatus.SUCCESS, BatchItemStatus.CACHED):
+                if item.quality and item.status in (BatchItemStatus.SUCCESS, BatchItemStatus.CACHED, BatchItemStatus.FILTERED_LOW_QUALITY):
                     confidence_str = f" ({item.quality.confidence:.0%})"
                 if item.status == BatchItemStatus.CACHED:
                     confidence_str += " [cached]"
                 if item.status == BatchItemStatus.RESUMED:
                     confidence_str = " [already exists]"
+                if item.status == BatchItemStatus.FILTERED_LOW_QUALITY:
+                    confidence_str += " [filtered - below min confidence]"
 
                 # Print to stderr (not stdout) so it doesn't mix with converted content
                 # flush=True ensures immediate output even when stderr is piped/redirected
@@ -749,6 +792,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
             on_progress=progress_callback,
             keep_data_uris=args.keep_data_uris if hasattr(args, "keep_data_uris") else False,
             cache=cache,
+            min_confidence=args.min_confidence,
         )
         # Add resumed items to the result
         result.items.extend(resumed_items)
@@ -831,9 +875,15 @@ def _build_quality_manifest(result: BatchConversionResult) -> dict:
         "summary": {
             "total_files": int,
             "successful": int,
+            "cached": int,
+            "resumed": int,
             "failed": int,
             "unsupported": int,
-            "average_confidence": float | null  # null if no successful conversions
+            "skipped": int,
+            "filtered_low_quality": int,  # Files filtered out due to --min-confidence
+            "successful_without_quality": int,  # Files that passed without quality score
+            "completion_percentage": float,
+            "average_confidence": float | null  # null if no successful conversions with quality
         },
         "files": [
             {
@@ -846,19 +896,29 @@ def _build_quality_manifest(result: BatchConversionResult) -> dict:
                     "formatting_loss": [...],
                     ...
                 } | null,
-                "error": str | null
+                "metadata": {...} | null,
+                "error": str | null,
+                "error_type": str | null
             },
             ...
         ]
     }
+
+    Note: Files with status "success" or "cached" but quality=null were not evaluated
+    for quality confidence. When using --min-confidence, these files pass through
+    without being filtered. Users should manually review these files if quality
+    assurance is critical.
     """
     # Build summary
     # Use None for average_confidence when no files were successfully converted
     # to clearly indicate no quality data is available (vs 0.0 which could mean low quality)
     avg_confidence = None
     successful_items = result.successful_items
+    items_with_quality = []
+    items_without_quality = []
     if successful_items:
         items_with_quality = [item for item in successful_items if item.quality]
+        items_without_quality = [item for item in successful_items if not item.quality]
         if items_with_quality:
             total_confidence = sum(item.quality.confidence for item in items_with_quality)
             avg_confidence = total_confidence / len(items_with_quality)
@@ -872,6 +932,8 @@ def _build_quality_manifest(result: BatchConversionResult) -> dict:
             "failed": result.failed_count,
             "unsupported": result.unsupported_count,
             "skipped": result.skipped_count,
+            "filtered_low_quality": result.filtered_low_quality_count,
+            "successful_without_quality": len(items_without_quality),
             "completion_percentage": result.completion_percentage,
             "average_confidence": avg_confidence,
         },
