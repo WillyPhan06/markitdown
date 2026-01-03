@@ -105,6 +105,20 @@ def main():
 
                 # Combine filtering with manifest to see what was filtered
                 markitdown --batch /path/to/documents -o /output --min-confidence 0.7 --export-manifest quality.json
+
+            TOKEN ESTIMATION EXAMPLES:
+
+                # Estimate tokens before running batch conversion (for LLM-based workflows)
+                markitdown --batch /path/to/documents --estimate-tokens
+
+                # Combine with caching to see which files would use cached results
+                markitdown --batch /path/to/documents --estimate-tokens --cache
+
+                # Combine with resume to see which files would be skipped
+                markitdown --batch /path/to/documents -o /output --estimate-tokens --resume
+
+                # Export token estimates to manifest for planning
+                markitdown --batch /path/to/documents --estimate-tokens --export-manifest tokens.json
             """
         ).strip(),
     )
@@ -361,6 +375,22 @@ def main():
         ),
     )
 
+    # Token estimation argument
+    parser.add_argument(
+        "--estimate-tokens",
+        action="store_true",
+        help=(
+            "Estimate the number of LLM tokens that would be used for the batch conversion, "
+            "without actually performing the conversion. This is useful when using MarkItDown "
+            "with an LLM client (e.g., for image descriptions) to plan and budget token usage. "
+            "Shows estimated tokens for each file and the total for the batch. "
+            "Works with --cache (to show cached files that won't use tokens) and "
+            "--resume (to show files that would be skipped). "
+            "Use --export-manifest to save token estimates to a JSON file for further analysis. "
+            "Only applies in batch mode."
+        ),
+    )
+
     parser.add_argument("filename", nargs="*")
     args = parser.parse_args()
 
@@ -479,6 +509,10 @@ def main():
                 "Example: --min-confidence 0.7 to filter out files with less than 70% confidence."
             )
 
+    # Validate --estimate-tokens
+    if args.estimate_tokens and not args.batch:
+        _exit_with_error("--estimate-tokens can only be used with --batch mode.")
+
     if args.use_docintel:
         if args.endpoint is None:
             _exit_with_error(
@@ -534,7 +568,11 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
     1. INPUT VALIDATION:
        Ensures at least one file or directory was provided to process.
 
-    2. PROGRESS CALLBACK SETUP (if --progress flag is set):
+    2. TOKEN ESTIMATION (if --estimate-tokens flag is set):
+       Estimates LLM token usage before conversion without actually converting files.
+       Shows per-file estimates and batch totals, respecting --cache and --resume modes.
+
+    3. PROGRESS CALLBACK SETUP (if --progress flag is set):
        Creates a thread-safe progress callback that prints real-time updates to stderr.
        Thread safety is critical here because when --parallel is used with multiple workers,
        multiple threads may call the callback simultaneously. Without the lock, output could
@@ -552,7 +590,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
        - ? (UNSUPPORTED): No converter could handle this file type
        - ○ (SKIPPED): File was skipped (e.g., filtered out)
 
-    3. INPUT MODE DETECTION:
+    4. INPUT MODE DETECTION:
        Determines whether the user provided:
        - A single directory: Use convert_directory() which has built-in recursive scanning
          and pattern matching optimized for directory trees
@@ -564,7 +602,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
        mode handles the flexibility of "convert these specific things" where users might
        combine folders and individual files.
 
-    4. FILE FILTERING (for mixed mode):
+    5. FILE FILTERING (for mixed mode):
        When directories are mixed with files, we manually expand directories and then
        apply --include/--exclude patterns. This uses fnmatch for glob-style matching
        against just the filename (not the full path) for consistency with how users
@@ -575,11 +613,11 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
        Exclusions are applied AFTER inclusions, so you can do things like
        --include "*.doc*" --exclude "*_draft*" to get all Word docs except drafts.
 
-    5. CONVERSION EXECUTION:
+    6. CONVERSION EXECUTION:
        Calls either convert_directory() or convert_batch() with appropriate parameters.
        Both methods handle parallel execution internally via ThreadPoolExecutor.
 
-    6. OUTPUT HANDLING:
+    7. OUTPUT HANDLING:
        Three output modes based on --output flag:
        - No output flag: Print all markdown to stdout with file headers (useful for piping)
        - Output ends in .json: Write complete results as JSON (includes all metadata)
@@ -588,7 +626,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
        For directory output, preserve_structure=True only when input was a single directory,
        so the output mirrors the input's folder hierarchy.
 
-    7. QUALITY/SUMMARY REPORTING:
+    8. QUALITY/SUMMARY REPORTING:
        If --quality-json: Output full results as JSON to stderr (machine-readable)
        If --quality or --summary: Output human-readable summary to stderr
 
@@ -782,6 +820,39 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                     f"{len(files_to_convert)} files remaining",
                     file=sys.stderr,
                 )
+    else:
+        existing_outputs = {}
+
+    # Step 5.5: Handle --estimate-tokens mode
+    if args.estimate_tokens:
+        from ._token_estimator import estimate_batch_tokens
+
+        # Combine all files for estimation (including resumed files for completeness)
+        all_files_for_estimation = files_to_convert.copy()
+        for item in resumed_items:
+            all_files_for_estimation.append(item.source_path)
+
+        # Estimate tokens
+        token_estimate = estimate_batch_tokens(
+            all_files_for_estimation,
+            cache=cache,
+            resumed_files=existing_outputs,
+        )
+
+        # Print summary to stderr
+        print(str(token_estimate), file=sys.stderr)
+
+        # Export to manifest if requested
+        if args.export_manifest:
+            manifest = _build_token_manifest(token_estimate)
+            manifest_path = Path(args.export_manifest)
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+            print(f"Token estimate manifest written to {manifest_path}", file=sys.stderr)
+
+        # Exit without performing actual conversion
+        return
 
     # Step 6: Execute batch conversion on remaining files
     if files_to_convert:
@@ -967,6 +1038,49 @@ def _build_quality_manifest(result: BatchConversionResult) -> dict:
         manifest["files"].append(file_entry)
 
     return manifest
+
+
+def _build_token_manifest(token_estimate) -> dict:
+    """
+    Build a token estimation manifest dictionary for JSON export.
+
+    The manifest provides detailed token usage estimates for planning LLM costs.
+
+    Structure:
+    {
+        "summary": {
+            "total_files": int,
+            "files_using_llm": int,
+            "files_skipped": int,
+            "cached_files": int,
+            "resumed_files": int,
+            "total_image_count": int,
+            "total_input_tokens": int,
+            "total_output_tokens": int,
+            "total_tokens": int
+        },
+        "files": [
+            {
+                "source_path": str,
+                "category": str,  # "image", "pptx", "no_llm", "cached", "resumed"
+                "input_tokens": int,
+                "output_tokens": int,
+                "total_tokens": int,
+                "image_count": int,
+                "file_size_bytes": int,
+                "skip_reason": str | null  # Why this file won't use tokens
+            },
+            ...
+        ]
+    }
+
+    Args:
+        token_estimate: BatchTokenEstimate with per-file estimates.
+
+    Returns:
+        Dictionary ready for JSON serialization.
+    """
+    return token_estimate.to_dict()
 
 
 def _handle_output(args, result: DocumentConverterResult):

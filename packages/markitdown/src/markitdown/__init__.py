@@ -33,6 +33,13 @@ from ._batch import (
 )
 from ._cache import ConversionCache
 from ._document_metadata import DocumentMetadata
+from ._token_estimator import (
+    estimate_batch_tokens,
+    estimate_file_tokens,
+    BatchTokenEstimate,
+    FileTokenEstimate,
+    FileCategory,
+)
 
 __all__ = [
     "__version__",
@@ -62,4 +69,10 @@ __all__ = [
     "ConversionCache",
     # Document metadata
     "DocumentMetadata",
+    # Token estimation
+    "estimate_batch_tokens",
+    "estimate_file_tokens",
+    "BatchTokenEstimate",
+    "FileTokenEstimate",
+    "FileCategory",
 ]
