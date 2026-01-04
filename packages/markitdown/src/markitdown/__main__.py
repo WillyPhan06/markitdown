@@ -119,6 +119,23 @@ def main():
 
                 # Export token estimates to manifest for planning
                 markitdown --batch /path/to/documents --estimate-tokens --export-manifest tokens.json
+
+            PREVIEW MODE EXAMPLES:
+
+                # Preview batch conversion to see quality metrics without writing files
+                markitdown --batch /path/to/documents --preview
+
+                # Preview with progress updates during conversion
+                markitdown --batch /path/to/documents --preview --progress
+
+                # Preview and save results to a manifest for later analysis
+                markitdown --batch /path/to/documents --preview --export-manifest preview.json
+
+                # Preview with quality filtering to see what would be filtered
+                markitdown --batch /path/to/documents --preview --min-confidence 0.7
+
+                # Preview specific file types only
+                markitdown --batch /path/to/documents --preview --include "*.pdf" --include "*.docx"
             """
         ).strip(),
     )
@@ -391,6 +408,22 @@ def main():
         ),
     )
 
+    # Preview mode argument
+    parser.add_argument(
+        "--preview",
+        action="store_true",
+        help=(
+            "Run batch conversion in preview mode. Files are converted and quality metrics "
+            "are calculated, but no output files are written to disk. This allows you to "
+            "see quality metrics, confidence scores, and identify potential issues before "
+            "committing to a full conversion. Useful for planning batch conversions and "
+            "determining appropriate --min-confidence thresholds. "
+            "Automatically enables --summary to show results. "
+            "Use --export-manifest to save the preview results for later analysis. "
+            "Only applies in batch mode."
+        ),
+    )
+
     parser.add_argument("filename", nargs="*")
     args = parser.parse_args()
 
@@ -512,6 +545,17 @@ def main():
     # Validate --estimate-tokens
     if args.estimate_tokens and not args.batch:
         _exit_with_error("--estimate-tokens can only be used with --batch mode.")
+
+    # Validate --preview
+    if args.preview and not args.batch:
+        _exit_with_error("--preview can only be used with --batch mode.")
+
+    if args.preview and args.estimate_tokens:
+        _exit_with_error(
+            "--preview and --estimate-tokens are mutually exclusive. "
+            "--preview performs actual conversions to get quality metrics, "
+            "while --estimate-tokens only estimates token costs without converting."
+        )
 
     if args.use_docintel:
         if args.endpoint is None:
@@ -878,8 +922,11 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
     if is_single_directory:
         result.source_directory = source_directory
 
-    # Step 7: Handle output based on --output flag
-    if args.output:
+    # Step 7: Handle output based on --output flag and --preview mode
+    if args.preview:
+        # Preview mode: show quality metrics without writing files
+        _print_preview_summary(result, args)
+    elif args.output:
         output_path = Path(args.output)
         if output_path.suffix == ".json":
             # JSON output: write complete results including all metadata
@@ -913,16 +960,17 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                     )
                 )
 
-    # Step 8: Output quality/summary information if requested
-    if args.quality_json:
-        # Machine-readable JSON output to stderr
-        quality_dict = result.to_dict()
-        print(json.dumps(quality_dict, indent=2), file=sys.stderr)
-    elif args.quality or args.summary:
-        # Human-readable summary to stderr
-        print("\n" + str(result), file=sys.stderr)
-        print("\nOVERALL QUALITY:", file=sys.stderr)
-        print(str(result.overall_quality), file=sys.stderr)
+    # Step 8: Output quality/summary information if requested (skip if preview mode already showed it)
+    if not args.preview:
+        if args.quality_json:
+            # Machine-readable JSON output to stderr
+            quality_dict = result.to_dict()
+            print(json.dumps(quality_dict, indent=2), file=sys.stderr)
+        elif args.quality or args.summary:
+            # Human-readable summary to stderr
+            print("\n" + str(result), file=sys.stderr)
+            print("\nOVERALL QUALITY:", file=sys.stderr)
+            print(str(result.overall_quality), file=sys.stderr)
 
     # Step 9: Export manifest file if requested
     if args.export_manifest:
@@ -932,6 +980,345 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
         with open(manifest_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2)
         print(f"Quality manifest written to {manifest_path}", file=sys.stderr)
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format byte size to human-readable string."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    elif size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    else:
+        return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
+
+
+def _build_conversion_summary_lines(result: BatchConversionResult) -> List[str]:
+    """Build lines for the conversion summary section."""
+    lines = [
+        "",
+        "CONVERSION SUMMARY:",
+        f"  Total files processed: {result.total_count}",
+        f"  Successful:            {result.success_count}",
+    ]
+    if result.cached_count > 0:
+        lines.append(f"  Cached:                {result.cached_count}")
+    if result.resumed_count > 0:
+        lines.append(f"  Resumed:               {result.resumed_count}")
+    lines.append(f"  Failed:                {result.failed_count}")
+    lines.append(f"  Unsupported:           {result.unsupported_count}")
+    if result.filtered_low_quality_count > 0:
+        lines.append(f"  Filtered (low quality): {result.filtered_low_quality_count}")
+    lines.append(f"  Completion rate:       {result.completion_percentage:.1f}%")
+    return lines
+
+
+def _build_size_estimation_lines(result: BatchConversionResult) -> List[str]:
+    """Build lines for the output size estimation section."""
+    successful_items = result.successful_items
+    if not successful_items:
+        return []
+
+    # Calculate sizes from markdown content
+    total_size = 0
+    file_sizes = []
+    for item in successful_items:
+        if item.markdown:
+            size = len(item.markdown.encode("utf-8"))
+            total_size += size
+            file_sizes.append(size)
+
+    if not file_sizes:
+        return []
+
+    avg_size = total_size // len(file_sizes)
+    min_size = min(file_sizes)
+    max_size = max(file_sizes)
+
+    lines = [
+        "",
+        "OUTPUT SIZE ESTIMATION:",
+        f"  Total estimated size:  {_format_size(total_size)}",
+        f"  Average file size:     {_format_size(avg_size)}",
+        f"  Smallest file:         {_format_size(min_size)}",
+        f"  Largest file:          {_format_size(max_size)}",
+        f"  Number of files:       {len(file_sizes)}",
+    ]
+    return lines
+
+
+def _build_quality_metrics_lines(
+    items_with_quality: List[BatchItemResult], result: BatchConversionResult
+) -> tuple:
+    """
+    Build lines for the quality metrics section.
+
+    Args:
+        items_with_quality: List of successful items that have quality data
+        result: The full BatchConversionResult for accessing counts when no quality data
+
+    Returns:
+        Tuple of (lines, confidences, buckets) where buckets is the confidence distribution dict
+    """
+    if not items_with_quality:
+        lines = [
+            "",
+            "QUALITY METRICS:",
+            "  No successful conversions with quality data.",
+            "",
+        ]
+        # Show exactly what happened to help users understand
+        if result.failed_count > 0:
+            lines.append(f"  - {result.failed_count} file(s) failed during conversion")
+        if result.unsupported_count > 0:
+            lines.append(f"  - {result.unsupported_count} file(s) had unsupported format")
+        if result.filtered_low_quality_count > 0:
+            lines.append(f"  - {result.filtered_low_quality_count} file(s) were filtered out due to low quality")
+        if result.skipped_count > 0:
+            lines.append(f"  - {result.skipped_count} file(s) were skipped")
+        # If nothing specific, mention the total
+        if result.failed_count == 0 and result.unsupported_count == 0 and result.filtered_low_quality_count == 0 and result.skipped_count == 0:
+            lines.append(f"  - {result.total_count} file(s) were processed but none produced quality data")
+        return lines, [], {}
+
+    confidences = [item.quality.confidence for item in items_with_quality]
+    avg_confidence = sum(confidences) / len(confidences)
+    min_confidence = min(confidences)
+    max_confidence = max(confidences)
+
+    lines = [
+        "",
+        "QUALITY METRICS:",
+        f"  Average confidence:    {avg_confidence:.1%}",
+        f"  Min confidence:        {min_confidence:.1%}",
+        f"  Max confidence:        {max_confidence:.1%}",
+    ]
+
+    # Confidence distribution buckets
+    buckets = {
+        "90-100%": len([c for c in confidences if c >= 0.9]),
+        "70-89%": len([c for c in confidences if 0.7 <= c < 0.9]),
+        "50-69%": len([c for c in confidences if 0.5 <= c < 0.7]),
+        "Below 50%": len([c for c in confidences if c < 0.5]),
+    }
+
+    lines.append("")
+    lines.append("  Confidence distribution:")
+    for bucket, count in buckets.items():
+        if count > 0:
+            bar = "#" * min(count, 40)
+            lines.append(f"    {bucket:12s}: {count:4d} {bar}")
+
+    return lines, confidences, buckets
+
+
+def _build_warning_distribution_lines(items_with_quality: List[BatchItemResult]) -> List[str]:
+    """Build lines for the warning distribution analysis section."""
+    if not items_with_quality:
+        return [
+            "",
+            "WARNING DISTRIBUTION:",
+            "  No files with quality data to analyze for warnings.",
+        ]
+
+    # Collect all warnings and count by message
+    from collections import Counter
+    warning_counts = Counter()
+    total_warnings = 0
+
+    for item in items_with_quality:
+        if item.quality and item.quality.warnings:
+            for warning in item.quality.warnings:
+                warning_counts[warning.message] += 1
+                total_warnings += 1
+
+    if not warning_counts:
+        return [
+            "",
+            "WARNING DISTRIBUTION:",
+            f"  No warnings detected across {len(items_with_quality)} successfully converted file(s).",
+            "  All conversions completed without any quality concerns.",
+        ]
+
+    lines = [
+        "",
+        "WARNING DISTRIBUTION:",
+        f"  Total warnings: {total_warnings} across {len([i for i in items_with_quality if i.quality and i.quality.warnings])} files",
+        "",
+        "  Most common warnings:",
+    ]
+
+    # Show top 5 most common warnings
+    for message, count in warning_counts.most_common(5):
+        # Truncate long messages
+        display_msg = message[:50] + "..." if len(message) > 50 else message
+        lines.append(f"    [{count:3d}x] {display_msg}")
+
+    if len(warning_counts) > 5:
+        lines.append(f"    ... and {len(warning_counts) - 5} other warning types")
+
+    return lines
+
+
+def _build_threshold_recommendation_lines(confidences: List[float]) -> List[str]:
+    """Build lines for the --min-confidence threshold recommendations."""
+    if not confidences:
+        return []
+
+    lines = [
+        "",
+        "RECOMMENDED --min-confidence THRESHOLDS:",
+    ]
+
+    thresholds = [0.9, 0.7, 0.5, 0.3]
+    for threshold in thresholds:
+        passing = len([c for c in confidences if c >= threshold])
+        filtered = len(confidences) - passing
+        lines.append(f"  --min-confidence {threshold}: {passing} files pass, {filtered} filtered out")
+
+    return lines
+
+
+def _build_per_file_breakdown_lines(result: BatchConversionResult) -> List[str]:
+    """Build lines for the per-file quality breakdown section."""
+    all_items = result.items
+    items_sorted = sorted(
+        all_items,
+        key=lambda x: (
+            x.status.value,  # Group by status
+            -(x.quality.confidence if x.quality else 0),  # Then by confidence (descending)
+        ),
+    )
+
+    lines = [
+        "",
+        "PER-FILE QUALITY BREAKDOWN:",
+        "-" * 70,
+    ]
+
+    if not items_sorted:
+        lines.append("  No files to display.")
+        lines.append("-" * 70)
+        return lines
+
+    for item in items_sorted:
+        conf_str = f"{item.quality.confidence:.0%}" if item.quality else "N/A"
+
+        # Truncate path for readability
+        display_path = item.source_path
+        if len(display_path) > 45:
+            display_path = "..." + display_path[-42:]
+
+        # Add size info for successful items
+        size_str = ""
+        if item.markdown:
+            size_bytes = len(item.markdown.encode("utf-8"))
+            size_str = f" [{_format_size(size_bytes)}]"
+
+        if item.status == BatchItemStatus.SUCCESS or item.status == BatchItemStatus.CACHED:
+            lines.append(f"  [{conf_str:>4s}]{size_str} {display_path}")
+        elif item.status == BatchItemStatus.FILTERED_LOW_QUALITY:
+            lines.append(f"  [{conf_str:>4s}]{size_str} {display_path} (filtered - below threshold)")
+        elif item.status == BatchItemStatus.FAILED:
+            error_msg = item.error[:40] + "..." if item.error and len(item.error) > 40 else (item.error or "Unknown error")
+            lines.append(f"  [FAIL] {display_path}")
+            lines.append(f"         -> {error_msg}")
+        elif item.status == BatchItemStatus.UNSUPPORTED:
+            lines.append(f"  [SKIP] {display_path} (unsupported format)")
+
+    lines.append("-" * 70)
+    return lines
+
+
+def _build_next_steps_lines(has_quality_data: bool, buckets: dict) -> List[str]:
+    """Build lines for the next steps section."""
+    lines = [
+        "",
+        "NEXT STEPS:",
+        "  To perform the actual conversion, run without --preview:",
+    ]
+
+    if has_quality_data:
+        # Suggest a reasonable threshold based on distribution
+        suggested_threshold = 0.7 if buckets.get("Below 50%", 0) > 0 else None
+        if suggested_threshold:
+            lines.append(f"    markitdown --batch <input> -o <output> --min-confidence {suggested_threshold}")
+        else:
+            lines.append("    markitdown --batch <input> -o <output>")
+    else:
+        lines.append("    markitdown --batch <input> -o <output>")
+
+    lines.append("")
+    lines.append("  To save this preview for later analysis:")
+    lines.append("    markitdown --batch <input> --preview --export-manifest preview.json")
+
+    return lines
+
+
+def _print_preview_summary(result: BatchConversionResult, args):
+    """
+    Print a comprehensive preview summary showing quality metrics without writing files.
+
+    This function provides users with all the information they need to plan their
+    actual batch conversion, including:
+    - Overall conversion statistics
+    - Output size estimation
+    - Quality metrics distribution (confidence levels)
+    - Warning distribution analysis
+    - Per-file quality breakdown
+    - Recommendations for --min-confidence threshold
+
+    Args:
+        result: The BatchConversionResult containing all conversion data
+        args: CLI arguments for checking flags like --quality-json
+    """
+    # Build all output lines
+    lines = []
+
+    # Header
+    lines.append("")
+    lines.append("=" * 70)
+    lines.append("PREVIEW MODE - No files written to disk")
+    lines.append("=" * 70)
+
+    # Conversion summary
+    lines.extend(_build_conversion_summary_lines(result))
+
+    # Size estimation
+    lines.extend(_build_size_estimation_lines(result))
+
+    # Quality metrics
+    successful_items = result.successful_items
+    items_with_quality = [item for item in successful_items if item.quality]
+    quality_lines, confidences, buckets = _build_quality_metrics_lines(items_with_quality, result)
+    lines.extend(quality_lines)
+
+    # Warning distribution
+    lines.extend(_build_warning_distribution_lines(items_with_quality))
+
+    # Threshold recommendations
+    lines.extend(_build_threshold_recommendation_lines(confidences))
+
+    # Per-file breakdown
+    lines.extend(_build_per_file_breakdown_lines(result))
+
+    # Machine-readable output if requested
+    if args.quality_json:
+        quality_dict = result.to_dict()
+        lines.append("")
+        lines.append("JSON OUTPUT:")
+        lines.append(json.dumps(quality_dict, indent=2))
+
+    # Next steps
+    lines.extend(_build_next_steps_lines(bool(items_with_quality), buckets))
+
+    # Footer
+    lines.append("=" * 70)
+    lines.append("")
+
+    # Print all lines to stderr at once
+    print("\n".join(lines), file=sys.stderr)
 
 
 def _build_quality_manifest(result: BatchConversionResult) -> dict:
