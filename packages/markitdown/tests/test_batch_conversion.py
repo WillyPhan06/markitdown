@@ -1821,5 +1821,521 @@ class TestQualityFiltering:
         assert "/test/filtered_file.pdf" in summary
 
 
+class TestPerFileQualityJSON:
+    """Tests for --per-file-quality feature."""
+
+    def _run_cli(self, args, check=True):
+        """Helper to run the markitdown CLI command."""
+        cmd = [sys.executable, "-m", MARKITDOWN_MODULE] + args
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            cwd=os.path.dirname(TEST_FILES_DIR),
+        )
+        if check and result.returncode != 0:
+            print(f"STDOUT: {result.stdout}")
+            print(f"STDERR: {result.stderr}")
+        return result
+
+    def test_per_file_quality_requires_batch_mode(self):
+        """Test that --per-file-quality fails without --batch."""
+        result = self._run_cli([
+            os.path.join(TEST_FILES_DIR, "test.json"),
+            "--per-file-quality",
+        ], check=False)
+
+        assert result.returncode != 0
+        assert "--per-file-quality can only be used with --batch mode." in result.stdout
+
+    def test_per_file_quality_requires_output(self):
+        """Test that --per-file-quality fails without --output."""
+        result = self._run_cli([
+            "--batch", TEST_FILES_DIR,
+            "--include", "*.json",
+            "--per-file-quality",
+        ], check=False)
+
+        assert result.returncode != 0
+        assert "--per-file-quality requires --output to specify the output directory." in result.stdout
+
+    def test_per_file_quality_cannot_use_json_output(self):
+        """Test that --per-file-quality fails with JSON output."""
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            output_file = f.name
+
+        try:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "-o", output_file,
+            ], check=False)
+
+            assert result.returncode != 0
+            assert "--per-file-quality cannot be used with JSON output (--output *.json)." in result.stdout
+        finally:
+            if os.path.exists(output_file):
+                os.unlink(output_file)
+
+    def test_per_file_quality_creates_quality_json_files(self):
+        """Test that --per-file-quality creates .quality.json files alongside .md files."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Check that markdown files were created
+            md_files = list(Path(tmpdir).glob("*.md"))
+            assert len(md_files) >= 1
+
+            # Check that quality JSON files were created alongside
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) >= 1
+
+            # Should have same count as markdown files
+            assert len(quality_files) == len(md_files)
+
+    def test_per_file_quality_json_structure(self):
+        """Test that the .quality.json files have the correct structure."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Find a quality JSON file
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) >= 1
+
+            # Read and validate structure
+            with open(quality_files[0], "r") as f:
+                quality_data = json.load(f)
+
+            # Check all fields exist (consistent structure)
+            assert "source_path" in quality_data
+            assert "output_path" in quality_data
+            assert "status" in quality_data
+            assert "quality" in quality_data  # Can be null but key must exist
+            assert "metadata" in quality_data  # Can be null but key must exist
+            assert "title" in quality_data  # Can be null but key must exist
+
+            # For successful conversions, quality should have detailed info
+            if quality_data["status"] == "success":
+                assert quality_data["quality"] is not None
+                quality = quality_data["quality"]
+                assert "confidence" in quality
+                assert "converter_used" in quality
+
+    def test_per_file_quality_json_matches_markdown_file(self):
+        """Test that quality JSON file names match their markdown counterparts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Get all markdown files
+            md_files = list(Path(tmpdir).glob("*.md"))
+            assert len(md_files) >= 1
+
+            # For each markdown file, there should be a corresponding quality JSON
+            for md_file in md_files:
+                # test.md should have test.quality.json
+                expected_quality_file = md_file.with_suffix(".quality.json")
+                assert expected_quality_file.exists(), f"Missing quality file for {md_file}"
+
+    def test_per_file_quality_with_multiple_file_types(self):
+        """Test --per-file-quality with multiple file types."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--include", "*.xlsx",
+                "--per-file-quality",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Check that both markdown and quality files were created
+            md_files = list(Path(tmpdir).glob("*.md"))
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+
+            assert len(md_files) >= 2
+            assert len(quality_files) == len(md_files)
+
+    def test_per_file_quality_confirmation_message(self):
+        """Test that confirmation message is printed when quality JSON files are written."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Should mention quality JSON files in stderr
+            assert "quality JSON" in result.stderr.lower() or "quality json" in result.stderr
+
+    def test_per_file_quality_with_progress(self):
+        """Test --per-file-quality works alongside --progress."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "--progress",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Progress should still work
+            assert "[" in result.stderr and "]" in result.stderr
+
+            # Quality JSON files should be created
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) >= 1
+
+    def test_per_file_quality_with_export_manifest(self):
+        """Test --per-file-quality works alongside --export-manifest."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manifest_file = os.path.join(tmpdir, "manifest.json")
+
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "--export-manifest", manifest_file,
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Both per-file quality JSON and manifest should be created
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) >= 1
+            assert os.path.exists(manifest_file)
+
+            # Verify manifest is valid
+            with open(manifest_file, "r") as f:
+                manifest = json.load(f)
+                assert "summary" in manifest
+                assert "files" in manifest
+
+    def test_per_file_quality_output_path_in_json(self):
+        """Test that quality JSON includes the output_path field."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--per-file-quality",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Find a quality JSON file
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) >= 1
+
+            with open(quality_files[0], "r") as f:
+                quality_data = json.load(f)
+
+            # Should have output_path that points to the markdown file
+            assert "output_path" in quality_data
+            # The output path should be the corresponding .md file
+            output_path = Path(quality_data["output_path"])
+            assert output_path.suffix == ".md"
+
+    def test_per_file_quality_json_consistent_structure_all_files(self):
+        """Test that all quality JSON files have consistent structure with all fields present."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = self._run_cli([
+                "--batch", TEST_FILES_DIR,
+                "--include", "*.json",
+                "--include", "*.xlsx",
+                "--per-file-quality",
+                "-o", tmpdir,
+            ])
+
+            assert result.returncode == 0
+
+            # Get all quality JSON files
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) >= 2  # Should have at least 2 files
+
+            # Check that ALL quality JSON files have the same structure
+            expected_fields = {"source_path", "output_path", "status", "quality", "metadata", "title"}
+
+            for quality_file in quality_files:
+                with open(quality_file, "r") as f:
+                    quality_data = json.load(f)
+
+                # Verify all expected fields are present
+                actual_fields = set(quality_data.keys())
+                assert actual_fields == expected_fields, (
+                    f"Quality JSON file {quality_file.name} has inconsistent structure. "
+                    f"Expected fields: {expected_fields}, Actual fields: {actual_fields}"
+                )
+
+
+class TestWriteBatchResultsWithQualityJSON:
+    """Tests for write_batch_results with write_quality_json parameter."""
+
+    def test_write_quality_json_false_by_default(self):
+        """Test that quality JSON files are not created by default."""
+        markitdown = MarkItDown()
+
+        files = [os.path.join(TEST_FILES_DIR, "test.json")]
+        result = markitdown.convert_batch(files)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_mapping = write_batch_results(result, tmpdir)
+
+            # Should have markdown files
+            md_files = list(Path(tmpdir).glob("*.md"))
+            assert len(md_files) == 1
+
+            # Should NOT have quality JSON files
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) == 0
+
+    def test_write_quality_json_true(self):
+        """Test that quality JSON files are created when write_quality_json=True."""
+        markitdown = MarkItDown()
+
+        files = [os.path.join(TEST_FILES_DIR, "test.json")]
+        result = markitdown.convert_batch(files)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_mapping = write_batch_results(result, tmpdir, write_quality_json=True)
+
+            # Should have markdown files
+            md_files = list(Path(tmpdir).glob("*.md"))
+            assert len(md_files) == 1
+
+            # Should have quality JSON files
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) == 1
+
+    def test_write_quality_json_content(self):
+        """Test the content of quality JSON files."""
+        markitdown = MarkItDown()
+
+        files = [os.path.join(TEST_FILES_DIR, "test.json")]
+        result = markitdown.convert_batch(files)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_mapping = write_batch_results(result, tmpdir, write_quality_json=True)
+
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) == 1
+
+            with open(quality_files[0], "r") as f:
+                quality_data = json.load(f)
+
+            # Verify all fields exist (consistent structure)
+            assert "source_path" in quality_data
+            assert "output_path" in quality_data
+            assert "status" in quality_data
+            assert "quality" in quality_data
+            assert "metadata" in quality_data  # Always present, can be null
+            assert "title" in quality_data  # Always present, can be null
+
+            # Verify values for successful conversion
+            assert quality_data["status"] == "success"
+            assert quality_data["quality"] is not None
+            assert "confidence" in quality_data["quality"]
+
+    def test_write_quality_json_with_preserve_structure(self):
+        """Test quality JSON files with preserved directory structure."""
+        markitdown = MarkItDown()
+
+        result = markitdown.convert_directory(
+            TEST_FILES_DIR, include_patterns=["*.json"]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_mapping = write_batch_results(
+                result, tmpdir, preserve_structure=True, write_quality_json=True
+            )
+
+            # Quality JSON files should be alongside markdown files
+            for source_path, output_path in output_mapping.items():
+                md_path = Path(output_path)
+                quality_path = md_path.with_suffix(".quality.json")
+                assert quality_path.exists(), f"Missing quality file for {md_path}"
+
+    def test_write_quality_json_whitespace_only_title_becomes_none(self):
+        """Test that whitespace-only titles are rejected and become None."""
+        from markitdown._base_converter import DocumentConverterResult
+        from markitdown._conversion_quality import ConversionQuality
+
+        # Create a batch result with a whitespace-only title
+        result = BatchConversionResult()
+
+        quality = ConversionQuality()
+        quality.confidence = 0.9
+        quality.converter_used = "TestConverter"
+
+        # Create a document result with whitespace-only title
+        doc_result = DocumentConverterResult(
+            markdown="# Test content",
+            title="   ",  # Whitespace-only title
+        )
+        doc_result._quality = quality
+
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/whitespace_title.txt",
+                status=BatchItemStatus.SUCCESS,
+                result=doc_result,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_batch_results(result, tmpdir, write_quality_json=True)
+
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) == 1
+
+            with open(quality_files[0], "r") as f:
+                quality_data = json.load(f)
+
+            # Title should be None, not whitespace
+            assert quality_data["title"] is None
+
+    def test_write_quality_json_empty_string_title_becomes_none(self):
+        """Test that empty string titles become None."""
+        from markitdown._base_converter import DocumentConverterResult
+        from markitdown._conversion_quality import ConversionQuality
+
+        result = BatchConversionResult()
+
+        quality = ConversionQuality()
+        quality.confidence = 0.9
+        quality.converter_used = "TestConverter"
+
+        # Create a document result with empty string title
+        doc_result = DocumentConverterResult(
+            markdown="# Test content",
+            title="",  # Empty string title
+        )
+        doc_result._quality = quality
+
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/empty_title.txt",
+                status=BatchItemStatus.SUCCESS,
+                result=doc_result,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_batch_results(result, tmpdir, write_quality_json=True)
+
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) == 1
+
+            with open(quality_files[0], "r") as f:
+                quality_data = json.load(f)
+
+            # Title should be None
+            assert quality_data["title"] is None
+
+    def test_write_quality_json_valid_title_is_stripped(self):
+        """Test that valid titles with leading/trailing whitespace are stripped."""
+        from markitdown._base_converter import DocumentConverterResult
+        from markitdown._conversion_quality import ConversionQuality
+
+        result = BatchConversionResult()
+
+        quality = ConversionQuality()
+        quality.confidence = 0.9
+        quality.converter_used = "TestConverter"
+
+        # Create a document result with title that has leading/trailing whitespace
+        doc_result = DocumentConverterResult(
+            markdown="# Test content",
+            title="  My Document Title  ",  # Title with leading/trailing whitespace
+        )
+        doc_result._quality = quality
+
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/padded_title.txt",
+                status=BatchItemStatus.SUCCESS,
+                result=doc_result,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_batch_results(result, tmpdir, write_quality_json=True)
+
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) == 1
+
+            with open(quality_files[0], "r") as f:
+                quality_data = json.load(f)
+
+            # Title should be stripped but present
+            assert quality_data["title"] == "My Document Title"
+
+    def test_write_quality_json_tabs_and_newlines_only_title_becomes_none(self):
+        """Test that titles with only tabs, newlines, and spaces become None."""
+        from markitdown._base_converter import DocumentConverterResult
+        from markitdown._conversion_quality import ConversionQuality
+
+        result = BatchConversionResult()
+
+        quality = ConversionQuality()
+        quality.confidence = 0.9
+        quality.converter_used = "TestConverter"
+
+        # Create a document result with title that has only tabs and newlines
+        doc_result = DocumentConverterResult(
+            markdown="# Test content",
+            title="\t\n  \t\n",  # Only whitespace characters
+        )
+        doc_result._quality = quality
+
+        result.items.append(
+            BatchItemResult(
+                source_path="/test/whitespace_chars_title.txt",
+                status=BatchItemStatus.SUCCESS,
+                result=doc_result,
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            write_batch_results(result, tmpdir, write_quality_json=True)
+
+            quality_files = list(Path(tmpdir).glob("*.quality.json"))
+            assert len(quality_files) == 1
+
+            with open(quality_files[0], "r") as f:
+                quality_data = json.load(f)
+
+            # Title should be None
+            assert quality_data["title"] is None
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -726,6 +726,7 @@ def write_batch_results(
     preserve_structure: bool = True,
     file_extension: str = ".md",
     overwrite: bool = False,
+    write_quality_json: bool = False,
 ) -> Dict[str, str]:
     """
     Write batch conversion results to files.
@@ -736,10 +737,15 @@ def write_batch_results(
         preserve_structure: If True, preserve the source directory structure.
         file_extension: Extension for output files (default: ".md").
         overwrite: If True, overwrite existing files.
+        write_quality_json: If True, write a quality JSON file alongside each
+            markdown file. For example, if 'report.md' is written, this will
+            also create 'report.quality.json' containing quality metadata.
 
     Returns:
         Dictionary mapping source paths to output paths.
     """
+    import json
+
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
 
@@ -781,5 +787,37 @@ def write_batch_results(
                 f.write(item.markdown)
 
         output_mapping[item.source_path] = str(output_path)
+
+        # Write quality JSON file alongside the markdown file if requested
+        if write_quality_json:
+            # Create quality JSON path by replacing extension with .quality.json
+            # e.g., report.md -> report.quality.json
+            quality_json_path = output_path.with_suffix(".quality.json")
+
+            # Extract title, rejecting whitespace-only titles as they are not useful
+            title = None
+            if item.result and item.result.title:
+                stripped_title = item.result.title.strip()
+                if stripped_title:  # Only use non-empty title after stripping
+                    title = stripped_title
+
+            # Build quality data for this specific file
+            # All fields are always present for consistent JSON structure
+            quality_data: Dict[str, Any] = {
+                "source_path": item.source_path,
+                "output_path": str(output_path),
+                "status": item.status.value,
+                "quality": item.quality.to_dict() if item.quality else None,
+                "metadata": (
+                    item.metadata.to_dict()
+                    if item.metadata and not item.metadata.is_empty()
+                    else None
+                ),
+                "title": title,
+            }
+
+            # Write the quality JSON file
+            with open(quality_json_path, "w", encoding="utf-8") as f:
+                json.dump(quality_data, f, indent=2)
 
     return output_mapping

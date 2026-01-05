@@ -95,6 +95,18 @@ def main():
                 # Combine with progress and summary for full visibility
                 markitdown --batch /path/to/documents --progress --summary --export-manifest report.json
 
+            PER-FILE QUALITY JSON EXAMPLES:
+
+                # Output quality JSON files alongside each converted markdown file
+                # report.pdf -> report.md + report.quality.json
+                markitdown --batch /path/to/documents -o /output --per-file-quality
+
+                # Combine with other options
+                markitdown --batch /path/to/documents -o /output --per-file-quality --progress
+
+                # Use both per-file quality and manifest for complete coverage
+                markitdown --batch /path/to/documents -o /output --per-file-quality --export-manifest summary.json
+
             QUALITY FILTERING EXAMPLES:
 
                 # Only keep files with 70% or higher confidence (filter out low quality)
@@ -228,6 +240,20 @@ def main():
             "and detailed quality information (confidence, warnings, formatting losses) "
             "for each file individually. This makes it easy to review quality metrics "
             "per file after batch conversions. Only applies in batch mode."
+        ),
+    )
+
+    parser.add_argument(
+        "--per-file-quality",
+        action="store_true",
+        help=(
+            "Output a quality metadata JSON file alongside each converted markdown file. "
+            "For example, if 'report.pdf' is converted to 'report.md', this option will "
+            "also create 'report.quality.json' containing the quality metadata (confidence, "
+            "warnings, formatting losses, converter used, etc.) for that specific file. "
+            "This makes it easy to find the quality metadata for any converted file without "
+            "searching through a large manifest file. Only applies in batch mode with "
+            "directory output (not JSON output)."
         ),
     )
 
@@ -549,6 +575,22 @@ def main():
     # Validate --preview
     if args.preview and not args.batch:
         _exit_with_error("--preview can only be used with --batch mode.")
+
+    # Validate --per-file-quality
+    if args.per_file_quality and not args.batch:
+        _exit_with_error("--per-file-quality can only be used with --batch mode.")
+
+    if args.per_file_quality and not args.output:
+        _exit_with_error(
+            "--per-file-quality requires --output to specify the output directory. "
+            "The quality JSON files will be written alongside the markdown files."
+        )
+
+    if args.per_file_quality and args.output and Path(args.output).suffix == ".json":
+        _exit_with_error(
+            "--per-file-quality cannot be used with JSON output (--output *.json). "
+            "Use --output with a directory path instead."
+        )
 
     if args.preview and args.estimate_tokens:
         _exit_with_error(
@@ -941,10 +983,16 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                 result,
                 output_path,
                 preserve_structure=is_single_directory,
+                write_quality_json=args.per_file_quality,
             )
             print(
                 f"Wrote {len(output_mapping)} files to {output_path}", file=sys.stderr
             )
+            if args.per_file_quality:
+                print(
+                    f"Wrote {len(output_mapping)} quality JSON files alongside markdown files",
+                    file=sys.stderr,
+                )
     else:
         # No output specified: print all markdown to stdout
         # Separate each file with headers so output is parseable
