@@ -499,6 +499,7 @@ def convert_batch(
     skip_errors: bool = True,
     cache: Optional["ConversionCache"] = None,
     min_confidence: Optional[float] = None,
+    fallback_converters: bool = False,
     **kwargs: Any,
 ) -> BatchConversionResult:
     """
@@ -519,6 +520,10 @@ def convert_batch(
                Note: Files without a quality confidence score (quality=None) will pass
                through and be marked as SUCCESS, as there's no score to compare against.
                Use successful_without_quality_items to identify these files for manual review.
+        fallback_converters: If True, when a file fails to convert with its primary
+               converter, MarkItDown will attempt to use other available converters
+               before marking the file as failed. The quality metadata will track
+               which converters were attempted. Default is False.
         **kwargs: Additional arguments passed to each conversion.
 
     Returns:
@@ -557,9 +562,15 @@ def convert_batch(
                 pass
 
         try:
-            conversion_result = markitdown.convert(
-                source_str, stream_info=stream_info, **kwargs
-            )
+            # Use fallback converters if enabled, otherwise use normal conversion
+            if fallback_converters and source_path.is_file():
+                conversion_result = markitdown.convert_with_fallback(
+                    source_str, stream_info=stream_info, **kwargs
+                )
+            else:
+                conversion_result = markitdown.convert(
+                    source_str, stream_info=stream_info, **kwargs
+                )
 
             # Store in cache (only for local files)
             if cache is not None and source_path.is_file():

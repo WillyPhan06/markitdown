@@ -552,6 +552,7 @@ class MarkItDown:
         skip_errors: bool = True,
         cache: Optional["ConversionCache"] = None,
         min_confidence: Optional[float] = None,
+        fallback_converters: bool = False,
         **kwargs: Any,
     ) -> BatchConversionResult:
         """
@@ -577,6 +578,10 @@ class MarkItDown:
                            Note: Files without a quality confidence score (quality=None) will pass
                            through as SUCCESS since there's no score to compare. Use
                            successful_without_quality_items to identify these for manual review.
+            fallback_converters: If True, when a file fails to convert with its primary
+                           converter, MarkItDown will attempt to use other available converters
+                           before marking the file as failed. The quality metadata will track
+                           which converters were attempted. Default is False.
             **kwargs: Additional arguments passed to each conversion.
 
         Returns:
@@ -605,6 +610,7 @@ class MarkItDown:
             skip_errors=skip_errors,
             cache=cache,
             min_confidence=min_confidence,
+            fallback_converters=fallback_converters,
             **kwargs,
         )
 
@@ -809,6 +815,180 @@ class MarkItDown:
         raise UnsupportedFormatException(
             "Could not convert stream to Markdown. No converter attempted a conversion, suggesting that the filetype is simply not supported."
         )
+
+    def convert_with_fallback(
+        self,
+        source: Union[str, Path],
+        *,
+        stream_info: Optional[StreamInfo] = None,
+        **kwargs: Any,
+    ) -> DocumentConverterResult:
+        """
+        Convert a file to markdown, trying all available converters as fallbacks.
+
+        This method differs from the normal convert() method in that when the primary
+        converter(s) fail, it will attempt conversion using ALL other registered
+        converters, not just those that initially accepted the file based on its
+        extension/mimetype.
+
+        This is useful for files that may have been misidentified or contain embedded
+        content of a different type (e.g., a DOCX file that is actually mostly HTML).
+
+        The quality metadata will track which converters were attempted (and failed)
+        before the successful one.
+
+        Args:
+            source: Path to the file to convert.
+            stream_info: Optional stream info hints.
+            **kwargs: Additional arguments passed to converters.
+
+        Returns:
+            DocumentConverterResult with the markdown content and quality metadata.
+            The quality metadata will include:
+            - converter_used: The converter that successfully converted the file
+            - converters_attempted: List of converters that were tried but failed
+
+        Raises:
+            FileConversionException: If all converters fail.
+            UnsupportedFormatException: If no converter could handle the file.
+        """
+        if isinstance(source, Path):
+            source = str(source)
+
+        # First, try normal conversion
+        failed_converters: List[str] = []
+        try:
+            result = self.convert(source, stream_info=stream_info, **kwargs)
+            return result
+        except FileConversionException as e:
+            # Track which converters failed in the normal conversion
+            if e.attempts:
+                failed_converters.extend(
+                    type(attempt.converter).__name__ for attempt in e.attempts
+                )
+        except UnsupportedFormatException:
+            # No converter accepted the file initially, we'll try fallbacks
+            pass
+
+        # Get all registered converters sorted by priority
+        sorted_registrations = sorted(self._converters, key=lambda x: x.priority)
+
+        # Read the file into memory for multiple conversion attempts
+        with open(source, "rb") as fh:
+            file_content = fh.read()
+
+        # Try each converter that hasn't been tried yet
+        last_exception: Optional[Exception] = None
+        for converter_registration in sorted_registrations:
+            converter = converter_registration.converter
+            converter_name = type(converter).__name__
+
+            # Skip converters that already failed
+            if converter_name in failed_converters:
+                continue
+
+            # Create a fresh stream for each attempt
+            file_stream = io.BytesIO(file_content)
+
+            # Build kwargs for this converter
+            _kwargs = {k: v for k, v in kwargs.items()}
+            if self._llm_client is not None:
+                _kwargs.setdefault("llm_client", self._llm_client)
+            if self._llm_model is not None:
+                _kwargs.setdefault("llm_model", self._llm_model)
+            if self._llm_prompt is not None:
+                _kwargs.setdefault("llm_prompt", self._llm_prompt)
+            if self._style_map is not None:
+                _kwargs.setdefault("style_map", self._style_map)
+            if self._exiftool_path is not None:
+                _kwargs.setdefault("exiftool_path", self._exiftool_path)
+            _kwargs["_parent_converters"] = self._converters
+
+            # Create a minimal stream_info that doesn't restrict which converters accept
+            fallback_stream_info = StreamInfo()
+            if stream_info is not None:
+                # Keep URL info but not extension/mimetype that might restrict converters
+                fallback_stream_info = StreamInfo(
+                    url=stream_info.url,
+                    filename=stream_info.filename,
+                    local_path=stream_info.local_path,
+                )
+
+            try:
+                # Force the converter to try by directly calling convert
+                # Skip the accepts() check since we're doing a fallback attempt
+                result = converter.convert(file_stream, fallback_stream_info, **_kwargs)
+
+                if result is not None:
+                    # Normalize the content
+                    result.text_content = "\n".join(
+                        [line.rstrip() for line in re.split(r"\r?\n", result.text_content)]
+                    )
+                    result.text_content = re.sub(r"\n{3,}", "\n\n", result.text_content)
+
+                    # Ensure quality info exists
+                    if result._quality is None:
+                        result._quality = ConversionQuality()
+
+                    # Record which converter succeeded and which ones failed
+                    result._quality.converter_used = converter_name
+                    result._quality.converters_attempted = failed_converters.copy()
+
+                    # Extract document metadata if not already set
+                    if result._metadata is None or result._metadata.is_empty():
+                        file_stream.seek(0)
+                        try:
+                            result._metadata = extract_metadata(
+                                file_stream,
+                                fallback_stream_info,
+                                result.markdown,
+                                **_kwargs,
+                            )
+                        except Exception as e:
+                            # Metadata extraction failed - warn the user
+                            # The conversion itself succeeded, but metadata may be incomplete
+                            source_id = (
+                                fallback_stream_info.filename
+                                or fallback_stream_info.local_path
+                                or source
+                            )
+                            tb_lines = traceback.format_exc().strip().split("\n")
+                            tb_summary = "\n".join(tb_lines[-6:]) if len(tb_lines) > 6 else "\n".join(tb_lines)
+
+                            warn(
+                                f"Metadata extraction failed during fallback conversion for '{source_id}': "
+                                f"{type(e).__name__}: {e}\n"
+                                f"The conversion succeeded with {converter_name}, but document metadata may be incomplete.\n"
+                                f"Traceback (most recent call last):\n{tb_summary}",
+                                RuntimeWarning,
+                                stacklevel=2,
+                            )
+
+                    return result
+            except Exception as exc:
+                # This converter failed, record it and try the next one
+                failed_converters.append(converter_name)
+                last_exception = exc
+                continue
+
+        # All converters failed
+        if failed_converters:
+            # Build failed attempts for the exception
+            failed_attempts = [
+                FailedConversionAttempt(
+                    converter=type(converter_name, (), {"__name__": name})(),
+                    exc_info=None,
+                )
+                for name in failed_converters
+            ]
+            raise FileConversionException(
+                message=f"File conversion failed after trying {len(failed_converters)} converters: {', '.join(failed_converters)}",
+                attempts=failed_attempts,
+            )
+        else:
+            raise UnsupportedFormatException(
+                "Could not convert file to Markdown. No converter was able to handle this file."
+            )
 
     def register_page_converter(self, converter: DocumentConverter) -> None:
         """DEPRECATED: User register_converter instead."""

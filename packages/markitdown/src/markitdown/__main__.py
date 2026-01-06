@@ -148,6 +148,21 @@ def main():
 
                 # Preview specific file types only
                 markitdown --batch /path/to/documents --preview --include "*.pdf" --include "*.docx"
+
+            FALLBACK CONVERTERS EXAMPLES:
+
+                # Enable fallback converters to try alternative converters when primary fails
+                markitdown --batch /path/to/documents -o /output --fallback-converters
+
+                # Useful for mixed content files (e.g., DOCX with embedded HTML)
+                # If DocxConverter fails, HtmlConverter might succeed
+                markitdown --batch /path/to/documents -o /output --fallback-converters --progress
+
+                # Combine with manifest to see which converters were attempted
+                markitdown --batch /path/to/documents -o /output --fallback-converters --export-manifest results.json
+
+                # Use with per-file quality to see converter attempts per file
+                markitdown --batch /path/to/documents -o /output --fallback-converters --per-file-quality
             """
         ).strip(),
     )
@@ -450,6 +465,20 @@ def main():
         ),
     )
 
+    # Fallback converters argument
+    parser.add_argument(
+        "--fallback-converters",
+        action="store_true",
+        help=(
+            "Enable fallback converter mode for batch conversions. When a file fails to "
+            "convert with its primary converter, MarkItDown will attempt to use other "
+            "available converters before marking the file as failed. For example, a DOCX "
+            "file containing HTML might fail the DocxConverter but succeed with the "
+            "HtmlConverter. The quality metadata will track which converters were "
+            "attempted and which one ultimately succeeded. Only applies in batch mode."
+        ),
+    )
+
     parser.add_argument("filename", nargs="*")
     args = parser.parse_args()
 
@@ -598,6 +627,10 @@ def main():
             "--preview performs actual conversions to get quality metrics, "
             "while --estimate-tokens only estimates token costs without converting."
         )
+
+    # Validate --fallback-converters
+    if args.fallback_converters and not args.batch:
+        _exit_with_error("--fallback-converters can only be used with --batch mode.")
 
     if args.use_docintel:
         if args.endpoint is None:
@@ -775,6 +808,9 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
                 confidence_str = ""
                 if item.quality and item.status in (BatchItemStatus.SUCCESS, BatchItemStatus.CACHED, BatchItemStatus.FILTERED_LOW_QUALITY):
                     confidence_str = f" ({item.quality.confidence:.0%})"
+                    # Show if fallback converters were used
+                    if item.quality.converters_attempted:
+                        confidence_str += f" [fallback: {len(item.quality.converters_attempted)} tried]"
                 if item.status == BatchItemStatus.CACHED:
                     confidence_str += " [cached]"
                 if item.status == BatchItemStatus.RESUMED:
@@ -950,6 +986,7 @@ def _handle_batch_conversion(args, markitdown: MarkItDown, stream_info):
             keep_data_uris=args.keep_data_uris if hasattr(args, "keep_data_uris") else False,
             cache=cache,
             min_confidence=args.min_confidence,
+            fallback_converters=args.fallback_converters,
         )
         # Add resumed items to the result
         result.items.extend(resumed_items)

@@ -106,8 +106,12 @@ class ConversionQuality:
     # Converter-specific metrics
     metrics: Dict[str, Any] = field(default_factory=dict)
 
-    # The converter type that was used
+    # The converter type that was used (the one that succeeded)
     converter_used: Optional[str] = None
+
+    # List of converters that were attempted before the successful one
+    # This is populated when fallback_converters mode is enabled and the primary converter fails
+    converters_attempted: List[str] = field(default_factory=list)
 
     # Whether optional features were available
     optional_features_used: Dict[str, bool] = field(default_factory=dict)
@@ -203,6 +207,7 @@ class ConversionQuality:
             "formatting_loss": [f.value for f in self.formatting_loss],
             "metrics": self.metrics,
             "converter_used": self.converter_used,
+            "converters_attempted": self.converters_attempted,
             "optional_features_used": self.optional_features_used,
             "is_partial": self.is_partial,
             "completion_percentage": self.completion_percentage,
@@ -260,6 +265,7 @@ class ConversionQuality:
             formatting_loss=formatting_loss,
             metrics=data.get("metrics", {}),
             converter_used=data.get("converter_used"),
+            converters_attempted=data.get("converters_attempted", []),
             optional_features_used=data.get("optional_features_used", {}),
             is_partial=data.get("is_partial", False),
             completion_percentage=data.get("completion_percentage"),
@@ -272,6 +278,9 @@ class ConversionQuality:
 
         if self.converter_used:
             lines.append(f"Converter: {self.converter_used}")
+
+        if self.converters_attempted:
+            lines.append(f"Converters attempted (failed): {', '.join(self.converters_attempted)}")
 
         if self.is_partial:
             if self.completion_percentage is not None:
